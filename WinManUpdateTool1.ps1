@@ -43,7 +43,7 @@ param(
     [string]$WsusServer = '',
     [switch]$AutoElevate
 )
-$Script:version = '0.1beta1 (21 Nov 2026)'
+$Script:version = '0.2 (21 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -1019,7 +1019,11 @@ $lblCatalog.TextAlign = 'MiddleLeft'
 $lblCatalog.Dock = 'Fill'
 $txtCatalog = New-Object System.Windows.Forms.TextBox
 $txtCatalog.Dock = 'Fill'
-$txtCatalog.Text = $CatalogPath
+if ([string]::IsNullOrWhiteSpace($CatalogPath)) {
+    $txtCatalog.Text = Join-Path $script:WorkDir 'updates\wsusscn2.cab'
+} else {
+    $txtCatalog.Text = $CatalogPath
+}
 $btnBrowse = New-Object System.Windows.Forms.Button
 $btnBrowse.Text = 'Browse...'
 $btnBrowse.AutoSize = $true
