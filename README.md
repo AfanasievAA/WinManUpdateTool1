@@ -4,7 +4,8 @@ A self-contained PowerShell + WinForms tool for **scanning, downloading, install
 
 Scanning is performed against a **local `wsusscn2.cab` catalog** via the Windows Update Agent API (`ServerSelection = ssOthers`). Update files are downloaded from direct Microsoft CDN URLs (or from a local WSUS content store) and applied locally with `wusa.exe` / `DISM` / `msiexec`.
 
----
+<img width="1282" height="942" alt="Снимок" src="https://github.com/user-attachments/assets/d341f404-1dd5-4a3b-a47f-2f9e6f1d86d3" />
+
 
 ## Features
 
