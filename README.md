@@ -35,5 +35,7 @@ Scanning is performed against a **local `wsusscn2.cab` catalog** via the Windows
 
 ## Quick start
 
+Code -> Download ZIP -> Extract to a folder of your choice -> **Run WinManUpdateTool1.cmd** 
+
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1
