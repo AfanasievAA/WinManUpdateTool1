@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Self-contained PowerShell tool with a WinForms that does not depend on a working windows update service
-      1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers. 
+      1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers.
       2. Download - fetches update files by direct URLs taken from DownloadContents/BundledUpdates (Microsoft CDN), with server-side date checks so that only newer files are re-downloaded. Optionally, files can be pulled from a local WSUS server instead (see .PARAMETER WsusServer).
       3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065) or "/q /z". Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
       4. Uninstall - wusa.exe /uninstall /kb:N and, additionally, DISM /Remove-Package for Package_for_* service packages that wusa usually cannot remove on Windows 10/11.
@@ -43,7 +43,7 @@ param(
     [string]$WsusServer = '',
     [switch]$AutoElevate
 )
-$Script:version = "0.1beta1 (21 Nov 2026)"
+$Script:version = '0.1beta1 (21 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -53,6 +53,7 @@ $script:SearchCriteria = 'IsInstalled=0 and IsHidden=0 and DeploymentAction=*'
 $script:CancelMsg = '##OPERATION-CANCELED##'
 
 # --- Administrator rights ---
+# Return $true when the current process runs elevated
 function Test-IsAdmin {
     try {
         $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -60,7 +61,7 @@ function Test-IsAdmin {
     } catch { return $false }
 }
 
-# --- Relaunch with -STA if the host thread is not STA (WinForms requirement), once ---
+#  Relaunch with -STA if the host thread is not STA (WinForms requirement), once ---
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA -and -not $env:WUOT_NOSTA) {
     $env:WUOT_NOSTA = '1'
     $hostExe = 'powershell.exe'
@@ -73,7 +74,7 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.
     }
 }
 
-# --- Auto elevation ---
+# Auto elevation
 if ($AutoElevate -and -not (Test-IsAdmin)) {
     try {
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $PSCommandPath) | Out-Null
@@ -83,7 +84,7 @@ if ($AutoElevate -and -not (Test-IsAdmin)) {
     return
 }
 
-# --- Resolve the working folder: portable by default (script folder), with read-only fallbacks ---
+# Resolve the working folder: portable by default (script folder), with read-only fallbacks
 $script:WorkDir = $null
 $candidates = New-Object 'System.Collections.Generic.List[string]'
 if ($WorkDir -and $WorkDir.Trim() -ne '') { $candidates.Add($WorkDir.Trim()) }
@@ -101,7 +102,7 @@ if (-not $script:WorkDir) { throw 'Cannot create a writable working folder (trie
 $script:PortableMode = ($script:WorkDir -eq $PSScriptRoot)
 $script:LogFile = Join-Path $script:WorkDir 'WinManUpdateTool1.log'
 
-# --- State shared with the background runspace ---
+# State shared with the background runspace
 $script:sync = [hashtable]::Synchronized(@{})
 $script:sync.Log = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $script:sync.ItemStatus = [hashtable]::Synchronized(@{})
@@ -123,13 +124,14 @@ $script:HaveInstalledList = $false
 $script:ItemMap = @{}
 $script:Worker = $null
 
-# --- Logging: queue -> the GUI thread is the single writer (window + file) ---
+# Enqueue a log line for the GUI thread to display and append to the log file
 function Add-GuiLog {
     param([string]$m)
     $script:sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m))
 }
 
-function Drain-LogQueue {
+# Drain queued log lines into the GUI textbox and the log file
+function Receive-LogQueue {
     $lines = @()
     $line = $null
     while ($script:sync.Log.TryDequeue([ref]$line)) { $lines += $line }
@@ -142,11 +144,13 @@ function Drain-LogQueue {
     try { Add-Content -LiteralPath $script:LogFile -Value $lines -Encoding UTF8 -ErrorAction Stop } catch { }
 }
 
+# Show a modal message box owned by the main form
 function Show-GuiMsg {
     param([string]$Text, [string]$Title = 'WU Offline Tool')
     [System.Windows.Forms.MessageBox]::Show($form, $Text, $Title, 'OK', 'Information') | Out-Null
 }
 
+# Enable double buffering on a ListView to reduce redraw flicker
 function Enable-LvDoubleBuffer {
     param($Lv)
     try {
@@ -158,12 +162,16 @@ function Enable-LvDoubleBuffer {
 #  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg
 $script:WorkerScript = {
     $counters = @{ Psf = 0 }
-    $wsusStyle = 0        # remembered WSUS file-name pattern that worked (0..2), speeds up subsequent files
+    $script:wsusStyle = 0    # remembered WSUS file-name pattern that worked (0..2), speeds up subsequent files
 
+    # Queue a log line for the GUI thread
     function Write-Log { param([string]$m) $sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m)) }
+    # Update the status-bar text shown in the GUI
     function Write-Status { param([string]$m) $sync.Status = $m }
+    # Record the per-update status shown in the status column
     function Set-ItemStatus { param([string]$Uuid, [string]$Status) $sync.ItemStatus[$Uuid] = $Status }
 
+    # Publish progress fraction (0..1) and optional text to the GUI
     function Set-Progress {
         param([double]$Fraction, [string]$Text)
         if ($Fraction -lt 0) { $Fraction = 0 }
@@ -172,6 +180,7 @@ $script:WorkerScript = {
         if ($PSBoundParameters.ContainsKey('Text')) { $sync.ProgressText = $Text }
     }
 
+    # Ensure TLS 1.2 is enabled for outgoing HTTPS requests
     function Enable-Tls12 {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
     }
@@ -314,7 +323,7 @@ $script:WorkerScript = {
             ('{0}_{1}.{2}' -f $pure, $hash, $ext),   # style 1: <name>_<hash> (original CDN name)
             ('{0}{1}.{2}' -f $hash, $pure, $ext)     # style 2: <hash><name>
         )
-        $first = $wsusStyle
+        $first = $script:wsusStyle
         if ($first -lt 0 -or $first -gt 2) { $first = 0 }
         $order = @($first) + (@(0, 1, 2) | Where-Object { $_ -ne $first })
         foreach ($oi in $order) {
@@ -459,6 +468,7 @@ $script:WorkerScript = {
     }
 
     # MODE: Offline scan
+    # Enumerate missing updates against the local wsusscn2.cab catalog
     function Invoke-Scan {
         Write-Status 'Preparing the catalog...'
         Set-Progress 0 'Checking wsusscn2.cab'
@@ -536,7 +546,7 @@ $script:WorkerScript = {
         Write-Log 'Done. Mark the needed updates and run [Download selected].'
     }
 
-    # MODE: Download selected
+    # Download files of the selected updates (WSUS source first, then Internet CDN)
     function Invoke-Download {
         if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
         $wsusBase = Get-WsusBase
@@ -577,7 +587,7 @@ $script:WorkerScript = {
                     if ($ws) {
                         $dlUrl = $ws.Url
                         $dlUnc = $ws.Unc
-                        $wsusStyle = $ws.Style
+                        $script:wsusStyle = $ws.Style
                         $srcName = 'WSUS'
                     } elseif ($wsusBase -ne '') {
                         Write-Log ('{0}: {1} was not found on the WSUS server - falling back to the Internet CDN.' -f $it.KB, $name)
@@ -612,7 +622,8 @@ $script:WorkerScript = {
         Write-Log 'Download: all selected updates processed.'
     }
 
-    #  MODE: Install selected 
+    #  MODE: Install selected
+    # Apply downloaded packages (msu/cab/exe/msi) to the local system
     function Invoke-Install {
         if (-not $IsAdmin) { throw 'Installation requires administrator rights. Restart the tool elevated.' }
         if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
@@ -636,7 +647,7 @@ $script:WorkerScript = {
             $files = @($files | Sort-Object -Property @{ Expression = {
                         $e = $_.Extension.ToLower()
                         if ($e -eq '.msu') { 0 } elseif ($e -eq '.cab') { 1 } elseif ($e -eq '.exe') { 2 } elseif ($e -eq '.msi') { 3 } else { 9 }
-                    } 
+                    }
                 })
             $fi = 0
             $itemOk = 0
@@ -707,7 +718,7 @@ $script:WorkerScript = {
         Write-Log 'Install: all selected updates processed.'
     }
 
-    #  MODE: List installed updates (for the uninstall tab) 
+    # Parse DISM /Get-Packages output into Package_for_* update records
     function Get-DismPackagesFromText {
         param([string]$Text)
         $result = New-Object 'System.Collections.Generic.List[object]'
@@ -731,6 +742,7 @@ $script:WorkerScript = {
         return , $result
     }
 
+    # Build a readable name from a DISM package identity string
     function Get-PrettyPackageName {
         param([string]$Identity)
         $parts = $Identity -split '~'
@@ -741,6 +753,8 @@ $script:WorkerScript = {
         return $Identity
     }
 
+    # MODE: List installed updates
+    # Build the installed-updates list from QFE and DISM data
     function Invoke-ListInstalled {
         Write-Status 'Collecting the list of installed updates...'
         $items = New-Object 'System.Collections.Generic.List[object]'
@@ -782,6 +796,7 @@ $script:WorkerScript = {
     }
 
     # MODE: Uninstall selected
+    # Remove the selected QFE entries (wusa) and DISM packages
     function Invoke-Uninstall {
         if (-not $IsAdmin) { throw 'Uninstallation requires administrator rights. Restart the tool elevated.' }
         if (@($UninstallSel).Count -eq 0) { Write-Log 'Nothing selected for uninstall.'; return }
@@ -823,7 +838,7 @@ $script:WorkerScript = {
         Write-Log 'Uninstall: operation finished.'
     }
 
-    #  Dispatcher 
+    #  Dispatcher
     try {
         switch ($Mode) {
             'GetCatalog' { Set-Progress 0 'Checking wsusscn2.cab'; Get-CatalogFile | Out-Null; Write-Log 'Catalog is ready for the offline scan.' }
@@ -847,6 +862,7 @@ $script:WorkerScript = {
 }
 
 #  GUI-thread functions: worker launch, list population, completion handling
+# Launch the background runspace for the given mode and selections
 function Start-Worker {
     param([string]$Mode, [string[]]$Selected = @(), [string[]]$UninstallSel = @())
     if ($sync.Busy) {
@@ -886,19 +902,22 @@ function Start-Worker {
     return $true
 }
 
+# Return the UUIDs of the checked rows in the available-updates list
 function Get-CheckedUpdates {
     $sel = @()
     foreach ($item in $lvUpdates.CheckedItems) { $sel += ([string]$item.Tag) }
     return , $sel
 }
 
+# Return the keys of the checked rows in the installed-updates list
 function Get-CheckedInstalled {
     $sel = @()
     foreach ($item in $lvInstalled.CheckedItems) { $sel += ([string]$item.Tag) }
     return , $sel
 }
 
-function Populate-UpdatesList {
+# Fill the available-updates list from the last scan result
+function Update-UpdatesList {
     $lvUpdates.BeginUpdate()
     $lvUpdates.Items.Clear()
     $script:ItemMap.Clear()
@@ -924,7 +943,8 @@ function Populate-UpdatesList {
     Add-GuiLog ('Update list: {0} entries. Checked by default are the ones with direct download URLs.' -f $sync.Result.Count)
 }
 
-function Populate-InstalledList {
+# Fill the installed-updates list from the last inventory result
+function Update-InstalledList {
     $lvInstalled.BeginUpdate()
     $lvInstalled.Items.Clear()
     foreach ($it in $sync.InstalledList) {
@@ -940,16 +960,17 @@ function Populate-InstalledList {
     Add-GuiLog ('Installed updates list: {0} entries.' -f $sync.InstalledList.Count)
 }
 
-function On-WorkerFinished {
+# Handle completion of the background runspace (populate lists, prompt for reboot)
+function Receive-WorkerFinished {
     if ($sync.ScanDone) {
         $sync.ScanDone = $false
         $script:HaveScanResults = $true
-        Populate-UpdatesList
+        Update-UpdatesList
     }
     if ($sync.InstalledDone) {
         $sync.InstalledDone = $false
         $script:HaveInstalledList = $true
-        Populate-InstalledList
+        Update-InstalledList
     }
     if ($sync.UninstallDone) {
         $sync.UninstallDone = $false
@@ -1264,14 +1285,14 @@ $form.Add_FormClosing({
     })
 
 $form.Add_FormClosed({
-        Drain-LogQueue
+        Receive-LogQueue
     })
 
 # --- State polling timer (GUI thread) ---
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 400
 $timer.Add_Tick({
-        Drain-LogQueue
+        Receive-LogQueue
 
         if ($sync.Status) { $lblStatus.Text = $sync.Status } else { $lblStatus.Text = 'Ready' }
         if ($sync.Progress -ge 0) { $pbStatus.Value = [Math]::Min(100, $sync.Progress) } else { $pbStatus.Value = 0 }
@@ -1303,7 +1324,7 @@ $timer.Add_Tick({
             try { $w.RS.Close() } catch { }
             $script:Worker = $null
             $sync.Busy = $false
-            On-WorkerFinished
+            Receive-WorkerFinished
         }
     })
 
@@ -1327,4 +1348,4 @@ $timer.Start()
 [void]$form.ShowDialog()
 $timer.Stop()
 $sync.Cancel = $true
-Drain-LogQueue
+Receive-LogQueue
