@@ -5,9 +5,10 @@
 .DESCRIPTION
     Self-contained PowerShell tool with a WinForms that does not depend on a working windows update service
       1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers.
-      2. Download - fetches update files by direct URLs taken from DownloadContents/BundledUpdates (Microsoft CDN), with server-side date checks so that only newer files are re-downloaded. Optionally, files can be pulled from a local WSUS server instead (see .PARAMETER WsusServer).
+      2. Download - fetches update files by direct URLs taken from DownloadContents/BundledUpdates (Microsoft CDN). A file whose name carries the embedded SHA-1 digest (the same digest WSUS keys its content store on) is verified against it: an intact file already on disk is reused as is with no network round-trips (delete the Updates folder or the KB subfolder to force a re-download), a corrupt or truncated one is re-downloaded (up to 3 attempts) and never left on disk; files whose name carries no digest fall back to server-side date checks. Optionally, files can be pulled from a local WSUS server instead (see .PARAMETER WsusServer).
       3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065), "/q" (MSRT kb890830) or "/q /z" (other exe installers); non-CBS Office cabs are extracted and their .msp payloads applied via msiexec /p. Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
       4. Uninstall - wusa.exe /uninstall /kb:N and, additionally, DISM /Remove-Package for Package_for_* service packages that wusa usually cannot remove on Windows 10/11.
+      5. Cleanup - reclaims disk space after the installed updates are tested: removes superseded components from the WinSxS store via DISM /StartComponentCleanup (the engine behind the Disk Cleanup item "Windows Update Cleanup"; with /ResetBase updates become permanent), clears the Windows Update caches (SoftwareDistribution\Download, Delivery Optimization) and deletes the update files downloaded by this tool (the wsusscn2.cab catalog copy is kept).
     WSUS download mode (optional): a WSUS server stores update files in its content store (IIS virtual directory "Content" -> WSUSContent folder) as Content/<hash[0:2]>/<hash>.<ext>, where the 40-hex <hash> is the SHA1 hash of the file - the same hash that is embedded in the Microsoft CDN file name. When a WSUS source is configured, the tool maps each CDN URL to the matching WSUS content path, probes it (HTTP HEAD or UNC Test-Path), and downloads from there; if a file is missing on the WSUS server (e.g. the update is not approved/downloaded there), the tool falls back to the Internet CDN automatically. The scan itself always remains offline (local wsusscn2.cab).
 
 .PARAMETER WorkDir
@@ -32,7 +33,7 @@
   Contacts:       AfanasievAA@yandex.ru
   https://github.com/AfanasievAA/WinManUpdateTool1
 
-    Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected].
+    Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].
     The first run needs Internet access once to fetch wsusscn2.cab (400-600 MB) unless a local copy or a share path is provided.
     The offline scan usually takes 5-40 minutes and cannot be interrupted (a WUA COM limitation).
     Target systems: Windows 10/11, Windows PowerShell 5.1 (built into the OS).
@@ -45,7 +46,7 @@ param(
     [string]$WsusServer = '',
     [switch]$AutoElevate
 )
-$Script:version = '0.4 (23 Nov 2026)'
+$Script:version = '0.5 (23 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -190,7 +191,7 @@ function Enable-LvDoubleBuffer {
     } catch { }
 }
 
-#  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg
+#  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, ResetBase, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg
 $script:WorkerScript = {
     $counters = @{ Psf = 0 }
     $script:wsusStyle = 0    # remembered WSUS file-name pattern that worked (0..3), speeds up subsequent files
@@ -232,6 +233,39 @@ $script:WorkerScript = {
         return $name
     }
 
+    # 40-hex SHA-1 digest embedded in a Microsoft CDN/WSUS file name (..._<hash>.<ext> or <hash>.<ext>) - the same digest WSUS stores and verifies its content files by; $null when the name carries no digest
+    function Get-FileNameHash {
+        param([string]$FileName)
+        if ($FileName -match '_([0-9a-fA-F]{40})\.[A-Za-z0-9]+$') { return $Matches[1].ToLower() }
+        if ($FileName -match '^([0-9a-fA-F]{40})\.[A-Za-z0-9]+$') { return $Matches[1].ToLower() }
+        return $null
+    }
+
+    # Integrity check of a file on disk: exists, non-empty and (when $ExpectedHash is given) its SHA-1 matches; $true only for an intact file
+    function Test-FileIntegrity {
+        param([string]$Path, [string]$ExpectedHash)
+        try {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+            if ((Get-Item -LiteralPath $Path).Length -le 0) { return $false }
+            if ([string]::IsNullOrEmpty($ExpectedHash)) { return $true }
+            return ((Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash.ToLower() -eq $ExpectedHash)
+        } catch { return $false }
+    }
+
+    # True when the file starts with the MSCF cabinet signature - catches HTML/error pages saved as .cab (e.g. by a proxy)
+    function Test-CabHeader {
+        param([string]$Path)
+        try {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+            $fs = [System.IO.File]::OpenRead($Path)
+            try {
+                $buf = New-Object 'byte[]' 4
+                if ($fs.Read($buf, 0, 4) -ne 4) { return $false }
+                return ($buf[0] -eq 0x4D -and $buf[1] -eq 0x53 -and $buf[2] -eq 0x43 -and $buf[3] -eq 0x46)
+            } finally { $fs.Dispose() }
+        } catch { return $false }
+    }
+
     # Streamed download with progress and cancel support; returns the byte count
     function Invoke-HttpDownload {
         param([string]$Url, [string]$DestPath, [string]$Label, [double]$Base, [double]$Span, [switch]$NoProxy)
@@ -270,6 +304,8 @@ $script:WorkerScript = {
                         }
                     }
                 } finally { $fs.Dispose() }
+                # a short read (the server closed the connection early) must fail instead of saving a truncated file
+                if ($len -gt 0 -and $total -ne $len) { throw ('Incomplete download: received {0} of {1} bytes' -f $total, $len) }
             } finally { $resp.Close() }
             Move-Item -LiteralPath $partPath -Destination $DestPath -Force
             return $total
@@ -405,21 +441,30 @@ $script:WorkerScript = {
     function Get-CatalogFile {
         $defaultTarget = Join-Path $WorkDir 'updates\wsusscn2.cab'
         if ($CatalogFile -and (Test-Path -LiteralPath $CatalogFile -PathType Leaf)) {
+            if (-not (Test-CabHeader -Path $CatalogFile)) { throw ('Catalog: the specified file is not a valid cabinet: {0}' -f $CatalogFile) }
             Write-Log ('Catalog: using the specified file: {0}' -f $CatalogFile)
             return $CatalogFile
         }
         if (Test-Path -LiteralPath $defaultTarget -PathType Leaf) {
-            $localUtc = (Get-Item -LiteralPath $defaultTarget).LastWriteTimeUtc
-            Write-Log ('Catalog: local wsusscn2.cab found (modified {0}), checking freshness...' -f (Get-Date $localUtc -Format 'dd.MM.yyyy HH:mm'))
-            if (-not (Test-RemoteNewer -Url $CatalogUrl -LocalUtc $localUtc)) {
-                Write-Log 'Catalog: the local copy is up to date, no download needed.'
-                return $defaultTarget
+            if (-not (Test-CabHeader -Path $defaultTarget)) {
+                Write-Log 'Catalog: the local wsusscn2.cab is not a valid cabinet (truncated or corrupt) - re-downloading it.'
+            } else {
+                $localUtc = (Get-Item -LiteralPath $defaultTarget).LastWriteTimeUtc
+                Write-Log ('Catalog: local wsusscn2.cab found (modified {0}), checking freshness...' -f (Get-Date $localUtc -Format 'dd.MM.yyyy HH:mm'))
+                if (-not (Test-RemoteNewer -Url $CatalogUrl -LocalUtc $localUtc)) {
+                    Write-Log 'Catalog: the local copy is up to date, no download needed.'
+                    return $defaultTarget
+                }
+                Write-Log 'Catalog: a newer wsusscn2.cab exists on the server - refreshing the local copy.'
             }
-            Write-Log 'Catalog: a newer wsusscn2.cab exists on the server - refreshing the local copy.'
         } else {
             Write-Log ('Catalog: no local wsusscn2.cab yet - downloading from {0} (400-600 MB, may take a while).' -f $CatalogUrl)
         }
         Invoke-HttpDownload -Url $CatalogUrl -DestPath $defaultTarget -Label 'Catalog wsusscn2.cab' -Base 0 -Span 1 | Out-Null
+        if (-not (Test-CabHeader -Path $defaultTarget)) {
+            Remove-Item -LiteralPath $defaultTarget -Force
+            throw 'Catalog: the downloaded wsusscn2.cab is not a valid cabinet (the server or a proxy returned garbage instead of the catalog) - deleted. Run the operation again to retry.'
+        }
         Write-Log ('Catalog: downloaded to {0}' -f $defaultTarget)
         return $defaultTarget
     }
@@ -640,6 +685,7 @@ $script:WorkerScript = {
             if (-not (Test-Path -LiteralPath $it.Dir)) { New-Item -ItemType Directory -Path $it.Dir -Force | Out-Null }
             $fcount = $it.Urls.Count
             $fi = 0
+            $itemFail = 0
             foreach ($url in $it.Urls) {
                 if ($sync.Cancel) { throw $CancelMsg }
                 $fi++
@@ -647,50 +693,103 @@ $script:WorkerScript = {
                 $dest = Join-Path $it.Dir $name
                 $base = (($idx - 1) + (($fi - 1) / $fcount)) / $totalItems
                 $span = (1.0 / $fcount) / $totalItems
-                # choose the download source: WSUS first when configured, Internet otherwise
-                $dlUrl = $url
-                $dlUnc = $false
-                $srcName = 'Internet'
-                if ($wsusBase -ne '') {
-                    $ws = $null
-                    try { $ws = Resolve-WsusSource -Url $url } catch {
-                        Write-Log ('WSUS probe failed: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $_.Exception.Message)
-                        $wsusBase = ''
-                    }
-                    if ($ws) {
-                        $dlUrl = $ws.Url
-                        $dlUnc = $ws.Unc
-                        $script:wsusStyle = $ws.Style
-                        $srcName = 'WSUS'
-                    } elseif ($wsusBase -ne '') {
-                        Write-Log ('{0}: WSUS contact OK, but {1} is not in its store (the update is most likely not approved/downloaded on that WSUS) - falling back to the Internet CDN.' -f $it.KB, $name)
-                    }
+                # expected SHA-1 digest: the one embedded in the CDN/WSUS file name (the WSUS store copy is byte-identical, so it matches both sources)
+                $nameHash = Get-FileNameHash $name
+                $bytes = -1
+                $fileOk = $false
+                $skipWsus = $false
+                # fast path: the file is on disk and its bytes match the SHA-1 pinned in its name, so it is exactly what this URL serves - reuse it as is, no probe, no server check (delete the Updates folder or the KB subfolder to force a re-download)
+                if ($nameHash -and (Test-Path -LiteralPath $dest) -and (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
+                    Write-Log ('{0}: {1} already downloaded - checksum verified, skipping.' -f $it.KB, $name)
+                    continue
                 }
-                if (Test-Path -LiteralPath $dest) {
-                    if ($dlUnc) {
-                        Write-Log ('{0}: {1} already downloaded - skipping.' -f $it.KB, $name)
-                        continue
+                # up to 3 attempts per file: corrupt/truncated downloads and transient network errors are retried, a broken file is never left on disk
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                    # choose the download source: WSUS first when configured (unless it proved empty/bad for this file), Internet otherwise
+                    $dlUrl = $url
+                    $dlUnc = $false
+                    $srcName = 'Internet'
+                    if ($wsusBase -ne '' -and -not $skipWsus) {
+                        $ws = $null
+                        try { $ws = Resolve-WsusSource -Url $url } catch {
+                            Write-Log ('WSUS probe failed: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $_.Exception.Message)
+                            $wsusBase = ''
+                        }
+                        if ($ws) {
+                            $dlUrl = $ws.Url
+                            $dlUnc = $ws.Unc
+                            $script:wsusStyle = $ws.Style
+                            $srcName = 'WSUS'
+                        } elseif ($wsusBase -ne '') {
+                            $skipWsus = $true
+                            Write-Log ('{0}: WSUS contact OK, but {1} is not in its store (the update is most likely not approved/downloaded on that WSUS) - falling back to the Internet CDN.' -f $it.KB, $name)
+                        }
                     }
-                    Set-Progress ($base + $span * 0.5) ('{0}: checking {1}' -f $it.KB, $name)
-                    if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq 'WSUS'))) {
-                        Write-Log ('{0}: {1} already downloaded and up to date - skipping.' -f $it.KB, $name)
-                        continue
+                    $needFetch = $true
+                    if (Test-Path -LiteralPath $dest) {
+                        # reuse a present file only when it passes the integrity check - protects against corrupt leftovers of earlier runs
+                        if (-not (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
+                            Write-Log ('{0}: {1} is present but corrupt (SHA-1 check failed) - re-downloading.' -f $it.KB, $name)
+                            Remove-Item -LiteralPath $dest -Force
+                        } elseif ($dlUnc) {
+                            Write-Log ('{0}: {1} already downloaded - skipping.' -f $it.KB, $name)
+                            $needFetch = $false
+                        } else {
+                            Set-Progress ($base + $span * 0.5) ('{0}: checking {1}' -f $it.KB, $name)
+                            if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq 'WSUS'))) {
+                                Write-Log ('{0}: {1} already downloaded and up to date - skipping.' -f $it.KB, $name)
+                                $needFetch = $false
+                            } else {
+                                Write-Log ('{0}: {1} - a newer version exists on the server, re-downloading.' -f $it.KB, $name)
+                                Remove-Item -LiteralPath $dest -Force
+                            }
+                        }
                     }
-                    Write-Log ('{0}: {1} - a newer version exists on the server, re-downloading.' -f $it.KB, $name)
+                    if (-not $needFetch) { $fileOk = $true; break }
+                    Set-ItemStatus $uuid ('Downloading {0}/{1}: {2}' -f $fi, $fcount, $name)
+                    try {
+                        if ($dlUnc) {
+                            Write-Log ('{0}: copying {1} from WSUS share' -f $it.KB, $name)
+                            Copy-Item -LiteralPath $dlUrl -Destination $dest -Force
+                            $bytes = (Get-Item -LiteralPath $dest).Length
+                        } else {
+                            Write-Log ('{0}: downloading {1} from {2}' -f $it.KB, $name, $srcName)
+                            $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq 'WSUS')
+                        }
+                    } catch {
+                        if ($_.Exception.Message -eq $CancelMsg) { throw }
+                        Write-Log ('{0}: downloading {1} from {2} failed: {3}' -f $it.KB, $name, $srcName, $_.Exception.Message)
+                        $bytes = 0
+                    }
+                    if (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash) { $fileOk = $true; break }
+                    # the saved data is garbage: often a small HTML/XML error page (proxy or captive portal) - recognize it to log a clear hint
+                    if (Test-Path -LiteralPath $dest) {
+                        $isHtml = $false
+                        try {
+                            $fs = [System.IO.File]::OpenRead($dest)
+                            try { $isHtml = ($fs.ReadByte() -eq 0x3C) } finally { $fs.Dispose() }
+                        } catch { }
+                        if ($isHtml) { Write-Log ('{0}: {1} from {2} is an HTML/XML page, not the package (proxy or captive-portal interference?) - retrying.' -f $it.KB, $name, $srcName) }
+                        else { Write-Log ('{0}: {1} from {2} fails the SHA-1 integrity check (expected {3}) - retrying.' -f $it.KB, $name, $srcName, $nameHash) }
+                        Remove-Item -LiteralPath $dest -Force
+                    }
+                    if ($srcName -eq 'WSUS') { $skipWsus = $true }
                 }
-                Set-ItemStatus $uuid ('Downloading {0}/{1}: {2}' -f $fi, $fcount, $name)
-                if ($dlUnc) {
-                    Write-Log ('{0}: copying {1} from WSUS share' -f $it.KB, $name)
-                    Copy-Item -LiteralPath $dlUrl -Destination $dest -Force
-                    $bytes = (Get-Item -LiteralPath $dest).Length
-                } else {
-                    Write-Log ('{0}: downloading {1} from {2}' -f $it.KB, $name, $srcName)
-                    $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq 'WSUS')
+                if (-not $fileOk) {
+                    $itemFail++
+                    Set-ItemStatus $uuid ('Download failed: {0}' -f $name)
+                    Write-Log ('{0}: {1} could not be downloaded intact after 3 attempts - skipped.' -f $it.KB, $name)
+                    continue
                 }
-                Write-Log ('{0}: saved {1} ({2:N1} MB)' -f $it.KB, $name, ($bytes / 1MB))
+                if ($bytes -ge 0) { Write-Log ('{0}: saved {1} ({2:N1} MB)' -f $it.KB, $name, ($bytes / 1MB)) }
             }
-            Set-ItemStatus $uuid 'Downloaded - ready to install'
-            Write-Log ('{0}: download finished.' -f $it.KB)
+            if ($itemFail -gt 0) {
+                Set-ItemStatus $uuid ('Downloaded with errors ({0} file(s) failed)' -f $itemFail)
+                Write-Log ('{0}: download finished with errors.' -f $it.KB)
+            } else {
+                Set-ItemStatus $uuid 'Downloaded - ready to install'
+                Write-Log ('{0}: download finished.' -f $it.KB)
+            }
         }
         Write-Log 'Download: all selected updates processed.'
     }
@@ -732,6 +831,14 @@ $script:WorkerScript = {
                 $span = (1.0 / $files.Count) / $totalItems
                 Set-Progress ($base + $span * 0.5) ('{0}: installing {1}' -f $it.KB, $file.Name)
                 Set-ItemStatus $uuid ('Installing {0}/{1}: {2}' -f $fi, $files.Count, $file.Name)
+                # never hand a corrupt file to an installer: a truncated package only produces a cryptic OS error
+                if (-not (Test-FileIntegrity -Path $file.FullName -ExpectedHash (Get-FileNameHash $file.Name))) {
+                    Remove-Item -LiteralPath $file.FullName -Force
+                    Write-Log ('{0}: {1} is corrupt (SHA-1 check failed) - deleted, run Download to re-fetch it.' -f $it.KB, $file.Name)
+                    Set-ItemStatus $uuid ('Corrupt file deleted: {0}' -f $file.Name)
+                    $itemErr++
+                    continue
+                }
                 $ext = $file.Extension.ToLower()
                 $exitCode = -1
                 $pkgIdentity = ''
@@ -936,6 +1043,68 @@ $script:WorkerScript = {
         Write-Log 'Uninstall: operation finished.'
     }
 
+    # MODE: Cleanup leftovers of installed updates (run after the updates are tested)
+    # Reclaims disk space: 1) superseded components in the WinSxS store via DISM /StartComponentCleanup - the engine behind the Disk Cleanup item "Windows Update Cleanup" (with $ResetBase also /ResetBase - afterwards updates can no longer be uninstalled);
+    # 2) Windows Update caches: SoftwareDistribution\Download (wuauserv/bits are stopped and restored to their previous state) and Delivery Optimization; 3) update files downloaded by this tool (wsusscn2.cab is kept)
+    function Invoke-Cleanup {
+        if (-not $IsAdmin) { throw 'Cleanup requires administrator rights. Restart the tool elevated.' }
+        $freeBefore = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace
+        Write-Log ('Cleanup: started. Free space on {0}: {1:N1} GB.' -f $env:SystemDrive, ($freeBefore / 1GB))
+        # 1) WinSxS superseded components (DISM runs in its own console window and shows its own progress)
+        Write-Status 'Removing superseded components (WinSxS)...'
+        Set-Progress 0 'DISM /StartComponentCleanup (WinSxS)'
+        Write-Log 'Cleanup: removing superseded components from the WinSxS store (the Disk Cleanup "Windows Update Cleanup" engine); this may take 10-30 minutes.'
+        if ($ResetBase) { Write-Log 'Cleanup: /ResetBase mode - after this run NO installed update can be uninstalled anymore.' }
+        $dismArgs = '/Online /NoRestart /Cleanup-Image /StartComponentCleanup'
+        if ($ResetBase) { $dismArgs += ' /ResetBase' }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\Dism.exe') -ArgumentList $dismArgs -Wait -PassThru
+        $sw.Stop()
+        $info = Get-ExitCodeInfo -Code $p.ExitCode -Tool 'dism-cleanup'
+        if ($info.Reboot) { $sync.RebootNeeded = $true }
+        if ($info.Ok) { Write-Log ('Cleanup: component store cleaned in {0:00} min {1:00} sec (DISM exit code {2}: {3}).' -f [int]$sw.Elapsed.TotalMinutes, $sw.Elapsed.Seconds, $p.ExitCode, $info.Text) }
+        else { Write-Log ('Cleanup: DISM StartComponentCleanup failed - exit code {0}: {1}.' -f $p.ExitCode, $info.Text) }
+        if ($sync.Cancel) { throw $CancelMsg }
+        # 2) Windows Update caches
+        Write-Status 'Clearing the Windows Update cache...'
+        Set-Progress 0.6 'Clearing SoftwareDistribution\Download'
+        $wuCache = Join-Path $env:SystemRoot 'SoftwareDistribution\Download'
+        if (Test-Path -LiteralPath $wuCache) {
+            $cacheBytes = [double](Get-ChildItem -LiteralPath $wuCache -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            Write-Log ('Cleanup: clearing the Windows Update download cache ({0:N1} MB).' -f ($cacheBytes / 1MB))
+            $wasRunning = @{}
+            foreach ($svc in @('wuauserv', 'bits')) { $wasRunning[$svc] = ((Get-Service -Name $svc -ErrorAction SilentlyContinue).Status -eq 'Running') }
+            Stop-Service -Name @('wuauserv', 'bits') -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path (Join-Path $wuCache '*') -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($svc in @('wuauserv', 'bits')) { if ($wasRunning[$svc]) { Start-Service -Name $svc -ErrorAction SilentlyContinue } }
+        } else { Write-Log 'Cleanup: SoftwareDistribution\Download not found - skipped.' }
+        try {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+            Write-Log 'Cleanup: Delivery Optimization cache cleared.'
+        } catch { Write-Log 'Cleanup: Delivery Optimization cache skipped (cmdlet unavailable or failed).' }
+        if ($sync.Cancel) { throw $CancelMsg }
+        # 3) Update files downloaded by this tool (the offline scan catalog is kept)
+        Write-Status 'Removing downloaded update files...'
+        Set-Progress 0.8 'Removing downloaded files'
+        $updatesDir = Join-Path $WorkDir 'Updates'
+        if (Test-Path -LiteralPath $updatesDir) {
+            $leftovers = @(Get-ChildItem -LiteralPath $updatesDir -Force | Where-Object { $_.Name -ine 'wsusscn2.cab' })
+            if ($leftovers.Count -gt 0) {
+                $dlBytes = [double]0
+                foreach ($lo in $leftovers) {
+                    if ($lo.PSIsContainer) { $dlBytes += [double](Get-ChildItem -LiteralPath $lo.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum }
+                    else { $dlBytes += [double]$lo.Length }
+                }
+                $leftovers | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Log ('Cleanup: removed {0} downloaded item(s) from {1} ({2:N1} MB); wsusscn2.cab kept.' -f $leftovers.Count, $updatesDir, ($dlBytes / 1MB))
+            } else { Write-Log 'Cleanup: no downloaded update files in the Updates folder.' }
+        }
+        Set-Progress 1 'Cleanup finished'
+        $freeAfter = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace
+        Write-Log ('Cleanup: finished. Free space on {0}: {1:N1} GB (about {2:N1} GB reclaimed).' -f $env:SystemDrive, ($freeAfter / 1GB), (($freeAfter - $freeBefore) / 1GB))
+        Write-Log 'Cleanup: run [Scan (offline)] again to refresh the download states in the update list.'
+    }
+
     #  Dispatcher
     try {
         switch ($Mode) {
@@ -945,6 +1114,7 @@ $script:WorkerScript = {
             'Install' { Invoke-Install }
             'ListInstalled' { Invoke-ListInstalled }
             'Uninstall' { Invoke-Uninstall }
+            'Cleanup' { Invoke-Cleanup }
         }
     } catch {
         if ($_.Exception.Message -eq $CancelMsg) {
@@ -962,7 +1132,7 @@ $script:WorkerScript = {
 #  GUI-thread functions: worker launch, list population, completion handling
 # Launch the background runspace for the given mode and selections
 function Start-Worker {
-    param([string]$Mode, [string[]]$Selected = @(), [string[]]$UninstallSel = @())
+    param([string]$Mode, [string[]]$Selected = @(), [string[]]$UninstallSel = @(), [bool]$ResetBase = $false)
     if ($sync.Busy) {
         Show-GuiMsg 'An operation is already running, please wait until it finishes.'
         return $false
@@ -987,6 +1157,7 @@ function Start-Worker {
     $rs.SessionStateProxy.SetVariable('WsusServer', ([string]$txtWsus.Text).Trim())
     $rs.SessionStateProxy.SetVariable('Selected', ([string[]]@($Selected)))
     $rs.SessionStateProxy.SetVariable('UninstallSel', ([string[]]@($UninstallSel)))
+    $rs.SessionStateProxy.SetVariable('ResetBase', $ResetBase)
     $rs.SessionStateProxy.SetVariable('IsAdmin', $script:IsAdmin)
     $rs.SessionStateProxy.SetVariable('CatalogUrl', $script:CatalogUrl)
     $rs.SessionStateProxy.SetVariable('SearchCriteria', $script:SearchCriteria)
@@ -1179,9 +1350,10 @@ $panelWsus.Controls.Add($lblWsusHint, 2, 0)
 $panelButtons = New-Object System.Windows.Forms.TableLayoutPanel
 $panelButtons.Dock = 'Top'
 $panelButtons.Height = 36
-$panelButtons.ColumnCount = 8
+$panelButtons.ColumnCount = 9
 $panelButtons.RowCount = 1
 $panelButtons.Padding = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
+[void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
 [void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
 [void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
 [void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
@@ -1207,8 +1379,11 @@ $btnMarkAll.AutoSize = $true
 $btnClearAll = New-Object System.Windows.Forms.Button
 $btnClearAll.Text = 'Unmark all'
 $btnClearAll.AutoSize = $true
-$btnOpenDir = New-Object System.Windows.Forms.Button
-$btnOpenDir.Text = 'Folder'
+ $btnCleanup = New-Object System.Windows.Forms.Button
+ $btnCleanup.Text = 'Cleanup leftovers'
+ $btnCleanup.AutoSize = $true
+ $btnOpenDir = New-Object System.Windows.Forms.Button
+ $btnOpenDir.Text = 'Folder'
 $btnOpenDir.AutoSize = $true
 $btnCancelOp = New-Object System.Windows.Forms.Button
 $btnCancelOp.Text = 'Cancel'
@@ -1221,9 +1396,10 @@ $panelButtons.Controls.Add($btnDownload, 1, 0)
 $panelButtons.Controls.Add($btnInstall, 2, 0)
 $panelButtons.Controls.Add($btnMarkAll, 3, 0)
 $panelButtons.Controls.Add($btnClearAll, 4, 0)
-$panelButtons.Controls.Add($btnAbout, 5, 0)
-$panelButtons.Controls.Add($btnOpenDir, 6, 0)
-$panelButtons.Controls.Add($btnCancelOp, 7, 0)
+ $panelButtons.Controls.Add($btnCleanup, 5, 0)
+ $panelButtons.Controls.Add($btnOpenDir, 6, 0)
+ $panelButtons.Controls.Add($btnCancelOp, 7, 0)
+$panelButtons.Controls.Add($btnAbout, 8, 0)
 
 # --- Tabs ---
 $tabs = New-Object System.Windows.Forms.TabControl
@@ -1422,7 +1598,18 @@ $btnUninstall.Add_Click({
         }
     })
 
-$form.Add_FormClosing({
+ $btnCleanup.Add_Click({
+        if (-not $script:IsAdmin) {
+            Show-GuiMsg "Cleanup requires administrator rights.`n`nRestart the tool elevated."
+            return
+        }
+        $ans = [System.Windows.Forms.MessageBox]::Show($form, "Clean up update leftovers?`n`n1) Superseded components in the WinSxS store - the Disk Cleanup 'Windows Update Cleanup' engine (DISM /StartComponentCleanup); superseded updates can NO LONGER be uninstalled afterwards.`n2) Windows Update caches (SoftwareDistribution\Download + Delivery Optimization).`n3) Update files downloaded by this tool (wsusscn2.cab is kept).`n`nRun this only after the installed updates are TESTED.", 'Confirm cleanup', 'YesNo', 'Question')
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        $rb = [System.Windows.Forms.MessageBox]::Show($form, "Also run the deep cleanup (/ResetBase)?`n`nIt removes ALL superseded component versions - afterwards NO installed update can be uninstalled at all.", 'Deep cleanup (ResetBase)', 'YesNo', 'Warning', [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+        [void](Start-Worker -Mode 'Cleanup' -ResetBase ($rb -eq [System.Windows.Forms.DialogResult]::Yes))
+    })
+
+ $form.Add_FormClosing({
         if ($sync.Busy) {
             $ans = [System.Windows.Forms.MessageBox]::Show($form, 'An operation is still running. Cancel it and exit?', 'WU Offline Tool', 'YesNo', 'Warning')
             if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
@@ -1458,6 +1645,7 @@ $timer.Add_Tick({
         $btnClearAll.Enabled = (-not $busy) -and $script:HaveScanResults
         $btnRefreshInst.Enabled = (-not $busy)
         $btnUninstall.Enabled = (-not $busy) -and $script:HaveInstalledList -and $script:IsAdmin
+        $btnCleanup.Enabled = (-not $busy) -and $script:IsAdmin
 
         if ($sync.ItemStatus.Count -gt 0) {
             foreach ($key in @($sync.ItemStatus.Keys)) {
@@ -1503,7 +1691,7 @@ if (-not $script:IsAdmin) {
     # Popup warning about the missing admin rights
     [void][System.Windows.Forms.MessageBox]::Show($form, "The tool is running WITHOUT administrator rights.`n`nScan and download are available, but installing or uninstalling updates requires elevation.`n`nRestart the tool elevated (e.g. with -AutoElevate) to enable install/uninstall.", 'WU Offline Tool', 'OK', 'Warning')
 }
-Add-GuiLog 'Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected].'
+Add-GuiLog 'Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].'
 
 $timer.Start()
 [void]$form.ShowDialog()
