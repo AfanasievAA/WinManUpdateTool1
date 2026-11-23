@@ -6,9 +6,9 @@
     Self-contained PowerShell tool with a WinForms that does not depend on a working windows update service
       1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers.
       2. Download - fetches update files by direct URLs taken from DownloadContents/BundledUpdates (Microsoft CDN), with server-side date checks so that only newer files are re-downloaded. Optionally, files can be pulled from a local WSUS server instead (see .PARAMETER WsusServer).
-      3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065) or "/q /z". Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
+      3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065), "/q" (MSRT kb890830) or "/q /z" (other exe installers); non-CBS Office cabs are extracted and their .msp payloads applied via msiexec /p. Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
       4. Uninstall - wusa.exe /uninstall /kb:N and, additionally, DISM /Remove-Package for Package_for_* service packages that wusa usually cannot remove on Windows 10/11.
-    WSUS download mode (optional): a WSUS server stores update files in its content store (IIS virtual directory "Content" -> WSUSContent folder) as Content/<hash[0:2]>/<hash[2:4]>/<file>, where the file name carries the SHA1 hash of the file - the same hash that is embedded in the Microsoft CDN file name. When a WSUS source is configured, the tool maps each CDN URL to the matching WSUS content path, probes it (HTTP HEAD or UNC Test-Path), and downloads from there; if a file is missing on the WSUS server, the tool falls back to the Internet CDN automatically. The scan itself always remains offline (local wsusscn2.cab).
+    WSUS download mode (optional): a WSUS server stores update files in its content store (IIS virtual directory "Content" -> WSUSContent folder) as Content/<hash[0:2]>/<hash>.<ext>, where the 40-hex <hash> is the SHA1 hash of the file - the same hash that is embedded in the Microsoft CDN file name. When a WSUS source is configured, the tool maps each CDN URL to the matching WSUS content path, probes it (HTTP HEAD or UNC Test-Path), and downloads from there; if a file is missing on the WSUS server (e.g. the update is not approved/downloaded there), the tool falls back to the Internet CDN automatically. The scan itself always remains offline (local wsusscn2.cab).
 
 .PARAMETER WorkDir
     Working folder (catalog copy, Updates subfolder, log file, state file). The tool is portable by default: it uses the folder where the script file itself is located, e.g. C:\Scripts for C:\Scripts\WinManUpdateTool1.ps1. If that folder is not writable, it falls back to C:\ProgramData\WinManUpdateTool1, then to %LOCALAPPDATA%\WinManUpdateTool1.
@@ -43,7 +43,7 @@ param(
     [string]$WsusServer = '',
     [switch]$AutoElevate
 )
-$Script:version = '0.2 (21 Nov 2026)'
+$Script:version = '0.3 (23 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -162,7 +162,7 @@ function Enable-LvDoubleBuffer {
 #  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg
 $script:WorkerScript = {
     $counters = @{ Psf = 0 }
-    $script:wsusStyle = 0    # remembered WSUS file-name pattern that worked (0..2), speeds up subsequent files
+    $script:wsusStyle = 0    # remembered WSUS file-name pattern that worked (0..3), speeds up subsequent files
 
     # Queue a log line for the GUI thread
     function Write-Log { param([string]$m) $sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m)) }
@@ -300,7 +300,7 @@ $script:WorkerScript = {
         return ($s + '/Content')
     }
 
-    # Map a Microsoft CDN URL to the WSUS content store layout: Content/<hash[0:2]>/<hash[2:4]>/<file>. The CDN file name embeds the SHA1 hash of the file, and WSUS stores files under the same hash. Several name layouts exist in the wild; candidates are probed and the working one is remembered. Returns @{ Url = <http url or unc path>; Style = <0..2>; Unc = <bool> } or $null when no mapping/probe matched.
+    # Map a Microsoft CDN URL to the WSUS content store layout: Content/<hash[0:2]>/<hash>.<ext>, where <hash> is the 40-hex SHA1 of the file - the same hash that is embedded in the Microsoft CDN file name (WSUS names content files by their SHA1 and keeps the original extension, e.g. Content/9c/9c8ff...d5.msu). Several name layouts exist in the wild; candidates are probed and the working one is remembered. Returns @{ Url = <http url or unc path>; Style = <0..3>; Unc = <bool> } or $null when no mapping/probe matched.
     function Resolve-WsusSource {
         param([string]$Url)
         if ($wsusBase -eq '') { return $null }
@@ -319,20 +319,21 @@ $script:WorkerScript = {
         }
         if (-not $hash) { return $null }
         $names = @(
-            ('{0}_{1}.{2}' -f $hash, $pure, $ext),   # style 0: <hash>_<name>
-            ('{0}_{1}.{2}' -f $pure, $hash, $ext),   # style 1: <name>_<hash> (original CDN name)
-            ('{0}{1}.{2}' -f $hash, $pure, $ext)     # style 2: <hash><name>
+            ('{0}.{1}' -f $hash, $ext),                    # style 0: <hash>.<ext> (native WSUS storage name)
+            ('{0}_{1}.{2}' -f $pure, $hash, $ext),         # style 1: <name>_<hash> (original CDN name)
+            ('{0}{1}.{2}' -f $hash, $pure, $ext),          # style 2: <hash><name> (locally published third-party content)
+            ('{0}_{1}.{2}' -f $hash, $pure, $ext)          # style 3: <hash>_<name>
         )
         $first = $script:wsusStyle
-        if ($first -lt 0 -or $first -gt 2) { $first = 0 }
-        $order = @($first) + (@(0, 1, 2) | Where-Object { $_ -ne $first })
+        if ($first -lt 0 -or $first -gt 3) { $first = 0 }
+        $order = @($first) + (@(0, 1, 2, 3) | Where-Object { $_ -ne $first })
         foreach ($oi in $order) {
             $cand = $names[$oi]
             if ($wsusBase -like '\\*') {
-                $p = Join-Path $wsusBase ($hash.Substring(0, 2) + '\' + $hash.Substring(2, 2) + '\' + $cand)
+                $p = Join-Path $wsusBase ($hash.Substring(0, 2) + '\' + $cand)
                 if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Url = $p; Style = $oi; Unc = $true } }
             } else {
-                $u = $wsusBase + '/' + $hash.Substring(0, 2) + '/' + $hash.Substring(2, 2) + '/' + $cand
+                $u = $wsusBase + '/' + $hash.Substring(0, 2) + '/' + $cand
                 if (Test-HttpUrlExists $u) { return @{ Url = $u; Style = $oi; Unc = $false } }
             }
         }
@@ -399,6 +400,8 @@ $script:WorkerScript = {
             3017 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, reboot required (3017)' }
             1641 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, reboot initiated (1641)' }
             2359302 { $info.Ok = $true; $info.Text = 'already installed (2359302)' }
+            1635 { $info.Text = 'patch package could not be opened (1635)' }
+            1642 { $info.Text = 'patch target product not found - the Office product is not installed (1642)' }
             87 { $info.Text = 'invalid parameter (87)' }
             112 { $info.Text = 'not enough disk space (112)' }
             5 { $info.Text = 'access denied (5) - run the tool elevated' }
@@ -409,6 +412,7 @@ $script:WorkerScript = {
                     $hex = '0x{0:X8}' -f ($Code -band 0xFFFFFFFF)
                     $txt = ('error {0}' -f $hex)
                     if ($hex -eq '0x800F081E') { $txt = 'package is not applicable to this system (0x800F081E)' }
+                if ($hex -eq '0x80070667') { $txt = 'invalid command line for this installer (0x80070667, Win32 1639)' }
                     if ($hex -eq '0x80240020') { $txt = 'installation canceled by the agent (0x80240020); try wusa without /quiet to see the reason' }
                 }
                 $info.Text = $txt
@@ -670,6 +674,26 @@ $script:WorkerScript = {
                     Write-Log ('{0}: checking applicability via DISM: {1}' -f $it.KB, $file.Name)
                     $cabInfo = Test-CabApplicable -CabPath $file.FullName
                     if (-not $cabInfo.Ok) {
+                        # DISM cannot open non-CBS cabs (exit code 2): Office-family updates are cab containers with .msp payloads.
+                        # Extract the patches and apply them with msiexec /p instead of skipping the update.
+                        $mspDir = Join-Path $file.DirectoryName ($file.BaseName + '.msp')
+                        if (Test-Path -LiteralPath $mspDir) { Remove-Item -LiteralPath $mspDir -Recurse -Force }
+                        New-Item -ItemType Directory -Path $mspDir -Force | Out-Null
+                        & "$env:SystemRoot\System32\expand.exe" $file.FullName '-F:*' $mspDir 2>&1 | Out-Null
+                        $msps = @(Get-ChildItem -LiteralPath $mspDir -Filter '*.msp' -File -Recurse -ErrorAction SilentlyContinue)
+                        if ($msps.Count -gt 0) {
+                            foreach ($msp in $msps) {
+                                Write-Log ('{0}: msiexec /p (Office patch from cab): {1}' -f $it.KB, $msp.Name)
+                                $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList ('/p "{0}" /qn /norestart' -f $msp.FullName) -Wait -PassThru
+                                $mspInfo = Get-ExitCodeInfo -Code $p.ExitCode -Tool $ext
+                                if ($mspInfo.Reboot) { $sync.RebootNeeded = $true }
+                                if ($mspInfo.Ok) { $itemOk++ } else { $itemErr++ }
+                                Write-Log ('{0}: {1} → exit code {2}: {3}' -f $it.KB, $msp.Name, $p.ExitCode, $mspInfo.Text)
+                                Add-StateRecord -KB $it.KB -FilePath $msp.FullName -Method 'msp' -Identity '' -ExitCode $p.ExitCode
+                            }
+                            Set-ItemStatus $uuid ('Office patch applied: {0} file(s)' -f $msps.Count)
+                            continue
+                        }
                         Write-Log ('{0}: skipping {1}: {2}' -f $it.KB, $file.Name, $cabInfo.Message)
                         Set-ItemStatus $uuid ('Check failed: {0}' -f $file.Name)
                         $itemErr++
@@ -692,6 +716,9 @@ $script:WorkerScript = {
                     $n = $file.Name.ToLower()
                     if ($n.StartsWith('ndp') -or $n.StartsWith('ofv') -or $n.Contains('2553065')) {
                         $argLine = '"{0}" /q /norestart' -f $file.FullName
+                    } elseif ($n.StartsWith('windows-kb890830')) {
+                        # MSRT accepts only its own switches (/q = quiet); anything else, e.g. /z, fails with 0x80070667 (1639 = ERROR_INVALID_COMMAND_LINE)
+                        $argLine = '"{0}" /q' -f $file.FullName
                     } else {
                         $argLine = '"{0}" /q /z' -f $file.FullName
                     }
