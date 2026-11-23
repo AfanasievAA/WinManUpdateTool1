@@ -6,7 +6,7 @@
     Self-contained PowerShell tool with a WinForms that does not depend on a working windows update service
       1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers.
       2. Download - fetches update files by direct URLs taken from DownloadContents/BundledUpdates (Microsoft CDN). A file whose name carries the embedded SHA-1 digest (the same digest WSUS keys its content store on) is verified against it: an intact file already on disk is reused as is with no network round-trips (delete the Updates folder or the KB subfolder to force a re-download), a corrupt or truncated one is re-downloaded (up to 3 attempts) and never left on disk; files whose name carries no digest fall back to server-side date checks. Optionally, files can be pulled from a local WSUS server instead (see .PARAMETER WsusServer).
-      3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065), "/q" (MSRT kb890830) or "/q /z" (other exe installers); non-CBS Office cabs are extracted and their .msp payloads applied via msiexec /p. Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
+      3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065), "/q" with an automatic "/qn /norestart" retry (MSRT kb890830: its package wraps an MSI that rejects the bare /q with 1639) or "/q /z" (other exe installers); non-CBS Office cabs are extracted and their .msp payloads applied via msiexec /p. Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
       4. Uninstall - wusa.exe /uninstall /kb:N and, additionally, DISM /Remove-Package for Package_for_* service packages that wusa usually cannot remove on Windows 10/11.
       5. Cleanup - reclaims disk space after the installed updates are tested: removes superseded components from the WinSxS store via DISM /StartComponentCleanup (the engine behind the Disk Cleanup item "Windows Update Cleanup"; with /ResetBase updates become permanent), clears the Windows Update caches (SoftwareDistribution\Download, Delivery Optimization) and deletes the update files downloaded by this tool (the wsusscn2.cab catalog copy is kept).
     WSUS download mode (optional): a WSUS server stores update files in its content store (IIS virtual directory "Content" -> WSUSContent folder) as Content/<hash[0:2]>/<hash>.<ext>, where the 40-hex <hash> is the SHA1 hash of the file - the same hash that is embedded in the Microsoft CDN file name. When a WSUS source is configured, the tool maps each CDN URL to the matching WSUS content path, probes it (HTTP HEAD or UNC Test-Path), and downloads from there; if a file is missing on the WSUS server (e.g. the update is not approved/downloaded there), the tool falls back to the Internet CDN automatically. The scan itself always remains offline (local wsusscn2.cab).
@@ -21,13 +21,13 @@
     Optional download source: http://<server>[:8530][/Content] or a UNC path to the WSUS content folder (e.g. \\wsus\wsus$\WSUSContent). Can also be typed in the GUI. Empty (default) = download from the Internet CDN. The GUI value is saved to settings.json in the working folder on exit and restored on the next start; an explicit -WsusServer parameter overrides the saved value.
 
 .PARAMETER AutoElevate
-    Relaunch the tool elevated (UAC prompt) if it was started without administrator rights.
+    Legacy switch with no effect: the tool now always relaunches itself elevated (UAC prompt) at startup when started with user rights. Kept for backward compatibility with existing shortcuts.
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1
 
 .EXAMPLE
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1 -AutoElevate -CatalogPath "\\srv\wsus\wsusscn2.cab" -WsusServer "http://wsus:8530"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1 -CatalogPath "\\srv\wsus\wsusscn2.cab" -WsusServer "http://wsus:8530"
 .NOTES
   Author:         Andrew Afanasiev
   Contacts:       AfanasievAA@yandex.ru
@@ -37,7 +37,7 @@
     The first run needs Internet access once to fetch wsusscn2.cab (400-600 MB) unless a local copy or a share path is provided.
     The offline scan usually takes 5-40 minutes and cannot be interrupted (a WUA COM limitation).
     Target systems: Windows 10/11, Windows PowerShell 5.1 (built into the OS).
-    The tool must run elevated (STA) for install/uninstall; scan and download work for any user.
+    The tool needs administrator rights for its operations, so it relaunches itself elevated (UAC prompt) at startup when started with user rights, and it restarts itself on an STA thread for the WinForms GUI.
 #>
 #Requires -Version 5.1
 param(
@@ -46,7 +46,7 @@ param(
     [string]$WsusServer = '',
     [switch]$AutoElevate
 )
-$Script:version = '0.5 (23 Nov 2026)'
+$Script:version = '0.6 (23 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -54,6 +54,33 @@ $ErrorActionPreference = 'Continue'
 $script:CatalogUrl = 'https://go.microsoft.com/fwlink/p/?LinkID=74689'   # official redirect to the latest wsusscn2.cab
 $script:SearchCriteria = 'IsInstalled=0 and IsHidden=0 and DeploymentAction=*'
 $script:CancelMsg = '##OPERATION-CANCELED##'
+# installer exit codes used by the worker runspaces (injected via Start-Worker)
+$script:ExitRebootRequired = 3010                 # ERROR_SUCCESS_REBOOT_REQUIRED (wusa/DISM/msiexec)
+$script:ExitRebootRequiredAlt = 3017              # reboot-required success variant (WU stack)
+$script:ExitRebootInitiated = 1641                # ERROR_SUCCESS_REBOOT_INITIATED
+$script:ExitAlreadyInstalled = 2359302            # DISM: the package is already present
+$script:ExitBadCommandLine = -2147023257          # 0x80070667 = HRESULT_FROM_WIN32(1639 ERROR_BAD_COMMAND_LINE), the msiexec signature
+# download source names
+$script:SrcInternet = 'Internet'
+$script:SrcWsus = 'WSUS'
+# worker modes (Start-Worker -Mode ... and the worker dispatcher switch)
+$script:ModeGetCatalog = 'GetCatalog'
+$script:ModeScan = 'Scan'
+$script:ModeDownload = 'Download'
+$script:ModeInstall = 'Install'
+$script:ModeListInstalled = 'ListInstalled'
+$script:ModeUninstall = 'Uninstall'
+$script:ModeCleanup = 'Cleanup'
+# registry path for the OS build (CurrentBuild + UBR)
+$script:RegOsBuild = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+# WSUS content-store file-name layouts probed by Resolve-WsusSource; the integer values are stable and index the candidate list
+enum WsusNameStyle {
+    Native = 0              # <hash>.<ext> - the native WSUS storage name
+    CdnName = 1             # <name>_<hash>.<ext> - the original Microsoft CDN name
+    PublishedConcat = 2     # <hash><name>.<ext> - locally published third-party content
+    PublishedUnderscore = 3 # <hash>_<name>.<ext> - locally published third-party content
+}
 
 # --- Administrator rights ---
 # Return $true when the current process runs elevated
@@ -64,27 +91,36 @@ function Test-IsAdmin {
     } catch { return $false }
 }
 
-#  Relaunch with -STA if the host thread is not STA (WinForms requirement), once ---
-if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA -and -not $env:WUOT_NOSTA) {
-    $env:WUOT_NOSTA = '1'
+# Relaunch this script in a fresh host process: -Elevate asks UAC and restarts it elevated, otherwise it only restarts it on a fresh STA thread; the argument line is the same in both cases
+function Restart-ScriptHost {
+    param([switch]$Elevate)
     $hostExe = 'powershell.exe'
     try { $hostExe = (Get-Process -Id $PID).Path } catch { }
-    try {
-        Start-Process -FilePath $hostExe -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $PSCommandPath) | Out-Null
-        return
-    } catch {
-        Write-Warning ('Failed to relaunch with -STA, continuing on the current thread: {0}' -f $_.Exception.Message)
-    }
+    $argLine = '-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $PSCommandPath
+    if ($Elevate) { Start-Process -FilePath $hostExe -Verb RunAs -ArgumentList $argLine | Out-Null }
+    else { Start-Process -FilePath $hostExe -ArgumentList $argLine | Out-Null }
 }
 
-# Auto elevation
-if ($AutoElevate -and -not (Test-IsAdmin)) {
+# The tool has no useful unelevated mode (wusa/DISM/msiexec and service control need admin rights): relaunch itself elevated right at startup when started with user rights; WUOT_ELEVATED guards against a relaunch loop should the elevation not stick
+if (-not (Test-IsAdmin) -and -not $env:WUOT_ELEVATED) {
+    $env:WUOT_ELEVATED = '1'
     try {
-        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $PSCommandPath) | Out-Null
+        Restart-ScriptHost -Elevate
     } catch {
         Write-Warning ('Elevated launch was canceled or failed: {0}' -f $_.Exception.Message)
     }
     return
+}
+
+# Relaunch on a fresh STA thread when the host thread is not STA (WinForms requirement), once; a child of an elevated process stays elevated, so this restart does not lose the elevation
+if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA -and -not $env:WUOT_NOSTA) {
+    $env:WUOT_NOSTA = '1'
+    try {
+        Restart-ScriptHost
+        return
+    } catch {
+        Write-Warning ('Failed to relaunch with -STA, continuing on the current thread: {0}' -f $_.Exception.Message)
+    }
 }
 
 # Resolve the working folder: portable by default (script folder), with read-only fallbacks
@@ -191,10 +227,10 @@ function Enable-LvDoubleBuffer {
     } catch { }
 }
 
-#  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, ResetBase, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg
+#  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, ResetBase, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg, plus the shared constants (exit codes, source names, worker modes)
 $script:WorkerScript = {
     $counters = @{ Psf = 0 }
-    $script:wsusStyle = 0    # remembered WSUS file-name pattern that worked (0..3), speeds up subsequent files
+    $script:wsusStyle = [WsusNameStyle]::Native    # remembered WSUS file-name layout that matched last, speeds up subsequent files
 
     # Queue a log line for the GUI thread
     function Write-Log { param([string]$m) $sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m)) }
@@ -397,10 +433,10 @@ $script:WorkerScript = {
         return ($s + '/Content')
     }
 
-    # Map a Microsoft CDN URL to the WSUS content store layout: Content/<hash[0:2]>/<hash>.<ext>, where <hash> is the 40-hex SHA1 of the file - the same hash that is embedded in the Microsoft CDN file name (WSUS names content files by their SHA1 and keeps the original extension, e.g. Content/9c/9c8ff...d5.msu). Several name layouts exist in the wild; candidates are probed and the working one is remembered. Returns @{ Url = <http url or unc path>; Style = <0..3>; Unc = <bool> } or $null when no mapping/probe matched.
+    # Map a Microsoft CDN URL to the WSUS content store layout: Content/<hash[0:2]>/<hash>.<ext>, where <hash> is the 40-hex SHA1 of the file - the same hash that is embedded in the Microsoft CDN file name (WSUS names content files by their SHA1 and keeps the original extension, e.g. Content/9c/9c8ff...d5.msu). Several name layouts exist in the wild (see [WsusNameStyle]); candidates are probed and the working one is remembered. Returns @{ Url = <http url or unc path>; Style = <[WsusNameStyle] member>; Unc = <bool> } or $null when no mapping/probe matched.
     function Resolve-WsusSource {
-        param([string]$Url)
-        if ($wsusBase -eq '') { return $null }
+        param([string]$Url, [string]$Base)
+        if ($Base -eq '') { return $null }
         $name = Get-UrlFileName $Url
         $hash = $null
         $pure = $null
@@ -415,26 +451,46 @@ $script:WorkerScript = {
             $pure = $name.Substring(0, $name.Length - $hash.Length - $ext.Length)
         }
         if (-not $hash) { return $null }
-        $names = @(
-            ('{0}.{1}' -f $hash, $ext),                    # style 0: <hash>.<ext> (native WSUS storage name)
-            ('{0}_{1}.{2}' -f $pure, $hash, $ext),         # style 1: <name>_<hash> (original CDN name)
-            ('{0}{1}.{2}' -f $hash, $pure, $ext),          # style 2: <hash><name> (locally published third-party content)
-            ('{0}_{1}.{2}' -f $hash, $pure, $ext)          # style 3: <hash>_<name>
-        )
-        $first = $script:wsusStyle
-        if ($first -lt 0 -or $first -gt 3) { $first = 0 }
-        $order = @($first) + (@(0, 1, 2, 3) | Where-Object { $_ -ne $first })
+        # candidate store file names per layout style; the style that matched last is probed first
+        $names = @{}
+        $names[[int][WsusNameStyle]::Native] = ('{0}.{1}' -f $hash, $ext)
+        $names[[int][WsusNameStyle]::CdnName] = ('{0}_{1}.{2}' -f $pure, $hash, $ext)
+        $names[[int][WsusNameStyle]::PublishedConcat] = ('{0}{1}.{2}' -f $hash, $pure, $ext)
+        $names[[int][WsusNameStyle]::PublishedUnderscore] = ('{0}_{1}.{2}' -f $hash, $pure, $ext)
+        $all = @([int][WsusNameStyle]::Native, [int][WsusNameStyle]::CdnName, [int][WsusNameStyle]::PublishedConcat, [int][WsusNameStyle]::PublishedUnderscore)
+        $first = [int]$script:wsusStyle
+        if ($all -notcontains $first) { $first = [int][WsusNameStyle]::Native }
+        $order = @($first) + ($all | Where-Object { $_ -ne $first })
         foreach ($oi in $order) {
             $cand = $names[$oi]
-            if ($wsusBase -like '\\*') {
-                $p = Join-Path $wsusBase ($hash.Substring(0, 2) + '\' + $cand)
-                if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Url = $p; Style = $oi; Unc = $true } }
+            if ($Base -like '\\*') {
+                $p = Join-Path $Base ($hash.Substring(0, 2) + '\' + $cand)
+                if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Url = $p; Style = [WsusNameStyle]$oi; Unc = $true } }
             } else {
-                $u = $wsusBase + '/' + $hash.Substring(0, 2) + '/' + $cand
-                if (Test-HttpUrlExists $u) { return @{ Url = $u; Style = $oi; Unc = $false } }
+                $u = $Base + '/' + $hash.Substring(0, 2) + '/' + $cand
+                if (Test-HttpUrlExists $u) { return @{ Url = $u; Style = [WsusNameStyle]$oi; Unc = $false } }
             }
         }
         return $null
+    }
+
+    # Pick the download source for one file: the WSUS content store first (when configured and the file is present there), the Internet CDN otherwise; updates the shared $State (WsusBase is cleared when the WSUS probe fails, SkipWsus marks the file as absent from the store for the remaining attempts). Returns an object: Url = what to fetch from, Unc = fetch from a share path by copying, Source = source name for logging
+    function Get-DownloadSource {
+        param([string]$Url, [hashtable]$State, [string]$KB, [string]$Name)
+        if ($State.WsusBase -eq '' -or $State.SkipWsus) { return [pscustomobject]@{ Url = $Url; Unc = $false; Source = $SrcInternet } }
+        $ws = $null
+        try { $ws = Resolve-WsusSource -Url $Url -Base $State.WsusBase } catch {
+            Write-Log ('WSUS probe failed: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $_.Exception.Message)
+            $State.WsusBase = ''
+            return [pscustomobject]@{ Url = $Url; Unc = $false; Source = $SrcInternet }
+        }
+        if ($ws) {
+            $script:wsusStyle = $ws.Style
+            return [pscustomobject]@{ Url = $ws.Url; Unc = $ws.Unc; Source = $SrcWsus }
+        }
+        $State.SkipWsus = $true
+        Write-Log ('{0}: WSUS contact OK, but {1} is not in its store (the update is most likely not approved/downloaded on that WSUS) - falling back to the Internet CDN.' -f $KB, $Name)
+        return [pscustomobject]@{ Url = $Url; Unc = $false; Source = $SrcInternet }
     }
 
     # Catalog wsusscn2.cab: given path -> local copy (date-checked) -> download from the official fwlink
@@ -495,17 +551,36 @@ $script:WorkerScript = {
         return , $urls
     }
 
-    # Human-readable meaning of an installer exit code
+    # Human-readable meaning of an installer exit code; $Tool 'msrt' additionally maps the MSRT scan result codes (KB891716)
     function Get-ExitCodeInfo {
         param([int]$Code, [string]$Tool)
         $info = @{ Ok = $false; Reboot = $false; Text = '' }
+        if ($Tool -eq 'msrt') {
+            switch ($Code) {
+                0 { $info.Ok = $true; $info.Text = 'success, no infection found' }
+                1 { $info.Text = 'OS environment error (1)' }
+                2 { $info.Text = 'not running as administrator (2)' }
+                3 { $info.Text = 'not a supported OS (3)' }
+                4 { $info.Text = 'scanner initialization error (4) - re-download the tool' }
+                6 { $info.Ok = $true; $info.Text = 'infection detected, no errors (6) - see %windir%\debug\mrt.log' }
+                7 { $info.Text = 'infection detected with errors (7) - see %windir%\debug\mrt.log' }
+                8 { $info.Ok = $true; $info.Text = 'infection removed, manual steps required (8) - see %windir%\debug\mrt.log' }
+                9 { $info.Text = 'infection removed with errors (9) - see %windir%\debug\mrt.log' }
+                10 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'infection removed, reboot required (10)' }
+                11 { $info.Text = 'infection removed with errors (11) - see %windir%\debug\mrt.log' }
+                12 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'infection removed, manual steps and reboot required (12)' }
+                13 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'infection removed, reboot required (13)' }
+            }
+            if ($info.Text -ne '') { return $info }
+            # codes outside the MSRT table (e.g. MSI 3010/1639) fall through to the generic mapping
+        }
         switch ($Code) {
             0 { $info.Ok = $true; $info.Text = 'success' }
             1 { $info.Ok = $true; $info.Text = 'success (code 1)' }
-            3010 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, REBOOT REQUIRED (3010)' }
-            3017 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, reboot required (3017)' }
-            1641 { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, reboot initiated (1641)' }
-            2359302 { $info.Ok = $true; $info.Text = 'already installed (2359302)' }
+            $ExitRebootRequired { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, REBOOT REQUIRED (3010)' }
+            $ExitRebootRequiredAlt { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, reboot required (3017)' }
+            $ExitRebootInitiated { $info.Ok = $true; $info.Reboot = $true; $info.Text = 'success, reboot initiated (1641)' }
+            $ExitAlreadyInstalled { $info.Ok = $true; $info.Text = 'already installed (2359302)' }
             1635 { $info.Text = 'patch package could not be opened (1635)' }
             1642 { $info.Text = 'patch target product not found - the Office product is not installed (1642)' }
             87 { $info.Text = 'invalid parameter (87)' }
@@ -518,7 +593,7 @@ $script:WorkerScript = {
                     $hex = '0x{0:X8}' -f ($Code -band 0xFFFFFFFF)
                     $txt = ('error {0}' -f $hex)
                     if ($hex -eq '0x800F081E') { $txt = 'package is not applicable to this system (0x800F081E)' }
-                    if ($hex -eq '0x80070667') { $txt = 'invalid command line for this installer (0x80070667, Win32 1639)' }
+                    if ($Code -eq $ExitBadCommandLine) { $txt = 'invalid command line for this installer (0x80070667, Win32 1639)' }
                     if ($hex -eq '0x80240020') { $txt = 'installation canceled by the agent (0x80240020); try wusa without /quiet to see the reason' }
                 }
                 $info.Text = $txt
@@ -659,14 +734,15 @@ $script:WorkerScript = {
     # Download files of the selected updates (WSUS source first, then Internet CDN)
     function Invoke-Download {
         if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
-        $wsusBase = Get-WsusBase
-        if ($wsusBase -ne '') {
-            Write-Log ('WSUS download source enabled: {0} (missing files fall back to the Internet CDN).' -f $wsusBase)
-            $probe = Test-WsusServerOnline -BaseUrl $wsusBase
+        # download-source state shared by all files of this run: WsusBase = the normalized WSUS content root ('' when disabled/unreachable), SkipWsus = the current file is known to be absent from the WSUS store
+        $dlState = @{ WsusBase = (Get-WsusBase); SkipWsus = $false }
+        if ($dlState.WsusBase -ne '') {
+            Write-Log ('WSUS download source enabled: {0} (missing files fall back to the Internet CDN).' -f $dlState.WsusBase)
+            $probe = Test-WsusServerOnline -BaseUrl $dlState.WsusBase
             if ($probe.Online) { Write-Log ('WSUS contact established, the server answered: {0}.' -f $probe.Detail) }
             else {
                 Write-Log ('WSUS server did not answer: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $probe.Detail)
-                $wsusBase = ''
+                $dlState.WsusBase = ''
             }
         } else { Write-Log 'Downloading from the Internet CDN.' }
         $totalItems = @($Selected).Count
@@ -697,7 +773,7 @@ $script:WorkerScript = {
                 $nameHash = Get-FileNameHash $name
                 $bytes = -1
                 $fileOk = $false
-                $skipWsus = $false
+                $dlState.SkipWsus = $false
                 # fast path: the file is on disk and its bytes match the SHA-1 pinned in its name, so it is exactly what this URL serves - reuse it as is, no probe, no server check (delete the Updates folder or the KB subfolder to force a re-download)
                 if ($nameHash -and (Test-Path -LiteralPath $dest) -and (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
                     Write-Log ('{0}: {1} already downloaded - checksum verified, skipping.' -f $it.KB, $name)
@@ -705,26 +781,11 @@ $script:WorkerScript = {
                 }
                 # up to 3 attempts per file: corrupt/truncated downloads and transient network errors are retried, a broken file is never left on disk
                 for ($attempt = 1; $attempt -le 3; $attempt++) {
-                    # choose the download source: WSUS first when configured (unless it proved empty/bad for this file), Internet otherwise
-                    $dlUrl = $url
-                    $dlUnc = $false
-                    $srcName = 'Internet'
-                    if ($wsusBase -ne '' -and -not $skipWsus) {
-                        $ws = $null
-                        try { $ws = Resolve-WsusSource -Url $url } catch {
-                            Write-Log ('WSUS probe failed: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $_.Exception.Message)
-                            $wsusBase = ''
-                        }
-                        if ($ws) {
-                            $dlUrl = $ws.Url
-                            $dlUnc = $ws.Unc
-                            $script:wsusStyle = $ws.Style
-                            $srcName = 'WSUS'
-                        } elseif ($wsusBase -ne '') {
-                            $skipWsus = $true
-                            Write-Log ('{0}: WSUS contact OK, but {1} is not in its store (the update is most likely not approved/downloaded on that WSUS) - falling back to the Internet CDN.' -f $it.KB, $name)
-                        }
-                    }
+                    # choose the download source: WSUS first when configured (unless it proved empty for this file), Internet otherwise
+                    $dl = Get-DownloadSource -Url $url -State $dlState -KB $it.KB -Name $name
+                    $dlUrl = $dl.Url
+                    $dlUnc = $dl.Unc
+                    $srcName = $dl.Source
                     $needFetch = $true
                     if (Test-Path -LiteralPath $dest) {
                         # reuse a present file only when it passes the integrity check - protects against corrupt leftovers of earlier runs
@@ -736,7 +797,7 @@ $script:WorkerScript = {
                             $needFetch = $false
                         } else {
                             Set-Progress ($base + $span * 0.5) ('{0}: checking {1}' -f $it.KB, $name)
-                            if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq 'WSUS'))) {
+                            if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq $SrcWsus))) {
                                 Write-Log ('{0}: {1} already downloaded and up to date - skipping.' -f $it.KB, $name)
                                 $needFetch = $false
                             } else {
@@ -754,7 +815,7 @@ $script:WorkerScript = {
                             $bytes = (Get-Item -LiteralPath $dest).Length
                         } else {
                             Write-Log ('{0}: downloading {1} from {2}' -f $it.KB, $name, $srcName)
-                            $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq 'WSUS')
+                            $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq $SrcWsus)
                         }
                     } catch {
                         if ($_.Exception.Message -eq $CancelMsg) { throw }
@@ -773,7 +834,7 @@ $script:WorkerScript = {
                         else { Write-Log ('{0}: {1} from {2} fails the SHA-1 integrity check (expected {3}) - retrying.' -f $it.KB, $name, $srcName, $nameHash) }
                         Remove-Item -LiteralPath $dest -Force
                     }
-                    if ($srcName -eq 'WSUS') { $skipWsus = $true }
+                    if ($srcName -eq $SrcWsus) { $dlState.SkipWsus = $true }
                 }
                 if (-not $fileOk) {
                     $itemFail++
@@ -842,6 +903,8 @@ $script:WorkerScript = {
                 $ext = $file.Extension.ToLower()
                 $exitCode = -1
                 $pkgIdentity = ''
+                $exitTool = $ext
+                $argLine2 = $null
                 if ($ext -eq '.msu') {
                     Write-Log ('{0}: wusa.exe (silent install): {1}' -f $it.KB, $file.Name)
                     $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wusa.exe') -ArgumentList ('"{0}" /quiet /norestart' -f $file.FullName) -Wait -PassThru -WindowStyle Hidden
@@ -893,19 +956,26 @@ $script:WorkerScript = {
                     if ($n.StartsWith('ndp') -or $n.StartsWith('ofv') -or $n.Contains('2553065')) {
                         $argLine = '"{0}" /q /norestart' -f $file.FullName
                     } elseif ($n.StartsWith('windows-kb890830')) {
-                        # MSRT accepts only its own switches (/q = quiet); anything else, e.g. /z, fails with 0x80070667 (1639 = ERROR_INVALID_COMMAND_LINE)
+                        # MSRT: the documented quiet switch is /q, but the package wraps an MSI whose msiexec rejects a bare /q with 1639 (0x80070667) - retry once with the MSI-style quiet line
                         $argLine = '"{0}" /q' -f $file.FullName
+                        $argLine2 = '"{0}" /qn /norestart' -f $file.FullName
+                        $exitTool = 'msrt'
                     } else {
                         $argLine = '"{0}" /q /z' -f $file.FullName
                     }
                     Write-Log ('{0}: running installer: {1}' -f $it.KB, $file.Name)
                     $p = Start-Process -FilePath $file.FullName -ArgumentList $argLine -Wait -PassThru
                     $exitCode = $p.ExitCode
+                    if ($argLine2 -and $exitCode -eq $ExitBadCommandLine) {
+                        Write-Log ('{0}: {1} rejected the quiet switch (Win32 1639 ERROR_BAD_COMMAND_LINE) - retrying with the MSI-style quiet line.' -f $it.KB, $file.Name)
+                        $p = Start-Process -FilePath $file.FullName -ArgumentList $argLine2 -Wait -PassThru
+                        $exitCode = $p.ExitCode
+                    }
                 } else {
                     Write-Log ('{0}: format {1} is not supported for manual installation - skipped.' -f $it.KB, $ext)
                     continue
                 }
-                $info = Get-ExitCodeInfo -Code $exitCode -Tool $ext
+                $info = Get-ExitCodeInfo -Code $exitCode -Tool $exitTool
                 if ($info.Reboot) { $sync.RebootNeeded = $true }
                 if ($info.Ok) { $itemOk++ } else { $itemErr++ }
                 Write-Log ('{0}: {1} → exit code {2}: {3}' -f $it.KB, $file.Name, $exitCode, $info.Text)
@@ -1108,13 +1178,13 @@ $script:WorkerScript = {
     #  Dispatcher
     try {
         switch ($Mode) {
-            'GetCatalog' { Set-Progress 0 'Checking wsusscn2.cab'; Get-CatalogFile | Out-Null; Write-Log 'Catalog is ready for the offline scan.' }
-            'Scan' { Invoke-Scan }
-            'Download' { Invoke-Download }
-            'Install' { Invoke-Install }
-            'ListInstalled' { Invoke-ListInstalled }
-            'Uninstall' { Invoke-Uninstall }
-            'Cleanup' { Invoke-Cleanup }
+            $ModeGetCatalog { Set-Progress 0 'Checking wsusscn2.cab'; Get-CatalogFile | Out-Null; Write-Log 'Catalog is ready for the offline scan.' }
+            $ModeScan { Invoke-Scan }
+            $ModeDownload { Invoke-Download }
+            $ModeInstall { Invoke-Install }
+            $ModeListInstalled { Invoke-ListInstalled }
+            $ModeUninstall { Invoke-Uninstall }
+            $ModeCleanup { Invoke-Cleanup }
         }
     } catch {
         if ($_.Exception.Message -eq $CancelMsg) {
@@ -1162,6 +1232,8 @@ function Start-Worker {
     $rs.SessionStateProxy.SetVariable('CatalogUrl', $script:CatalogUrl)
     $rs.SessionStateProxy.SetVariable('SearchCriteria', $script:SearchCriteria)
     $rs.SessionStateProxy.SetVariable('CancelMsg', $script:CancelMsg)
+    # hand the shared constants (exit codes, source names, worker modes) to the worker runspace
+    foreach ($cn in 'ExitRebootRequired', 'ExitRebootRequiredAlt', 'ExitRebootInitiated', 'ExitAlreadyInstalled', 'ExitBadCommandLine', 'SrcInternet', 'SrcWsus', 'ModeGetCatalog', 'ModeScan', 'ModeDownload', 'ModeInstall', 'ModeListInstalled', 'ModeUninstall', 'ModeCleanup') { $rs.SessionStateProxy.SetVariable($cn, (Get-Variable -Name $cn -Scope Script).Value) }
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript($script:WorkerScript.ToString())
@@ -1514,29 +1586,25 @@ $btnBrowse.Add_Click({
         }
     })
 
-$btnCatalogDl.Add_Click({ [void](Start-Worker -Mode 'GetCatalog') })
+$btnCatalogDl.Add_Click({ [void](Start-Worker -Mode $script:ModeGetCatalog) })
 
 $btnScan.Add_Click({
         Add-GuiLog ('Starting the offline scan. Catalog: "{0}" (empty = the local copy in the working folder, or a download).' -f $txtCatalog.Text)
-        [void](Start-Worker -Mode 'Scan')
+        [void](Start-Worker -Mode $script:ModeScan)
     })
 
 $btnDownload.Add_Click({
         $sel = Get-CheckedUpdates
         if ($sel.Count -eq 0) { Show-GuiMsg 'Check the updates you want to download first.'; return }
-        [void](Start-Worker -Mode 'Download' -Selected $sel)
+        [void](Start-Worker -Mode $script:ModeDownload -Selected $sel)
     })
 
 $btnInstall.Add_Click({
-        if (-not $script:IsAdmin) {
-            Show-GuiMsg "Installation requires administrator rights.`n`nRestart the tool elevated (or with the -AutoElevate switch)."
-            return
-        }
         $sel = Get-CheckedUpdates
         if ($sel.Count -eq 0) { Show-GuiMsg 'Check the updates you want to install first.'; return }
         $ans = [System.Windows.Forms.MessageBox]::Show($form, ("Install the selected updates ({0} items)?`n`nPackages are applied locally via wusa/DISM without contacting Windows Update. Do not close the window until it finishes." -f $sel.Count), 'Confirm installation', 'YesNo', 'Question')
         if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
-            [void](Start-Worker -Mode 'Install' -Selected $sel)
+            [void](Start-Worker -Mode $script:ModeInstall -Selected $sel)
         }
     })
 
@@ -1583,30 +1651,22 @@ $btnAbout.Add_Click({
         [void]$about.ShowDialog($form)
     })
 
-$btnRefreshInst.Add_Click({ [void](Start-Worker -Mode 'ListInstalled') })
+$btnRefreshInst.Add_Click({ [void](Start-Worker -Mode $script:ModeListInstalled) })
 
 $btnUninstall.Add_Click({
-        if (-not $script:IsAdmin) {
-            Show-GuiMsg "Uninstallation requires administrator rights.`n`nRestart the tool elevated."
-            return
-        }
         $sel = Get-CheckedInstalled
         if ($sel.Count -eq 0) { Show-GuiMsg 'Check the packages you want to uninstall first.'; return }
         $ans = [System.Windows.Forms.MessageBox]::Show($form, ("Uninstall the selected entries ({0} items)?`n`nA reboot may be required afterwards." -f $sel.Count), 'Confirm uninstall', 'YesNo', 'Warning')
         if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
-            [void](Start-Worker -Mode 'Uninstall' -UninstallSel $sel)
+            [void](Start-Worker -Mode $script:ModeUninstall -UninstallSel $sel)
         }
     })
 
  $btnCleanup.Add_Click({
-        if (-not $script:IsAdmin) {
-            Show-GuiMsg "Cleanup requires administrator rights.`n`nRestart the tool elevated."
-            return
-        }
         $ans = [System.Windows.Forms.MessageBox]::Show($form, "Clean up update leftovers?`n`n1) Superseded components in the WinSxS store - the Disk Cleanup 'Windows Update Cleanup' engine (DISM /StartComponentCleanup); superseded updates can NO LONGER be uninstalled afterwards.`n2) Windows Update caches (SoftwareDistribution\Download + Delivery Optimization).`n3) Update files downloaded by this tool (wsusscn2.cab is kept).`n`nRun this only after the installed updates are TESTED.", 'Confirm cleanup', 'YesNo', 'Question')
         if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         $rb = [System.Windows.Forms.MessageBox]::Show($form, "Also run the deep cleanup (/ResetBase)?`n`nIt removes ALL superseded component versions - afterwards NO installed update can be uninstalled at all.", 'Deep cleanup (ResetBase)', 'YesNo', 'Warning', [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
-        [void](Start-Worker -Mode 'Cleanup' -ResetBase ($rb -eq [System.Windows.Forms.DialogResult]::Yes))
+        [void](Start-Worker -Mode $script:ModeCleanup -ResetBase ($rb -eq [System.Windows.Forms.DialogResult]::Yes))
     })
 
  $form.Add_FormClosing({
@@ -1676,7 +1736,7 @@ try {
     $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
     $osName = $os.Caption
     $osBuild = $os.BuildNumber
-    $ubr = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).UBR
+    $ubr = (Get-ItemProperty -Path $script:RegOsBuild -ErrorAction SilentlyContinue).UBR
     if ($ubr) { $osBuild = ('{0}.{1}' -f $osBuild, $ubr) }
 } catch { $osName = [Environment]::OSVersion.VersionString; $osBuild = [Environment]::OSVersion.Version.ToString() }
 $adminTxt = 'no'
@@ -1686,11 +1746,6 @@ $modeTxt = 'fallback folder (the script folder is not writable)'
 if ($script:PortableMode) { $modeTxt = 'portable mode (next to the script)' }
 Add-GuiLog ('Working folder: {0} - {1}. Update files go to {0}\Updates.' -f $script:WorkDir, $modeTxt)
 Add-GuiLog ('Log file: {0}.' -f $script:LogFile)
-if (-not $script:IsAdmin) {
-    Add-GuiLog 'Running without administrator rights: scan and download are available. Restart elevated to install/uninstall.'
-    # Popup warning about the missing admin rights
-    [void][System.Windows.Forms.MessageBox]::Show($form, "The tool is running WITHOUT administrator rights.`n`nScan and download are available, but installing or uninstalling updates requires elevation.`n`nRestart the tool elevated (e.g. with -AutoElevate) to enable install/uninstall.", 'WU Offline Tool', 'OK', 'Warning')
-}
 Add-GuiLog 'Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].'
 
 $timer.Start()
