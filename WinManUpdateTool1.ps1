@@ -17,7 +17,7 @@
     Path to a ready-made wsusscn2.cab (e.g. a network share \\srv\wsus\wsusscn2.cab). Can also be typed in the GUI later. Resolution order: the given file -> a local copy in the working folder (server date is checked) -> download from go.microsoft.com/fwlink.
 
 .PARAMETER WsusServer
-    Optional download source: http://<server>[:8530][/Content] or a UNC path to the WSUS content folder (e.g. \\wsus\wsus$\WSUSContent). Can also be typed in the GUI. Empty (default) = download from the Internet CDN.
+    Optional download source: http://<server>[:8530][/Content] or a UNC path to the WSUS content folder (e.g. \\wsus\wsus$\WSUSContent). Can also be typed in the GUI. Empty (default) = download from the Internet CDN. The GUI value is saved to settings.json in the working folder on exit and restored on the next start; an explicit -WsusServer parameter overrides the saved value.
 
 .PARAMETER AutoElevate
     Relaunch the tool elevated (UAC prompt) if it was started without administrator rights.
@@ -30,6 +30,8 @@
 .NOTES
   Author:         Andrew Afanasiev
   Contacts:       AfanasievAA@yandex.ru
+  https://github.com/AfanasievAA/WinManUpdateTool1
+
     Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected].
     The first run needs Internet access once to fetch wsusscn2.cab (400-600 MB) unless a local copy or a share path is provided.
     The offline scan usually takes 5-40 minutes and cannot be interrupted (a WUA COM limitation).
@@ -43,7 +45,7 @@ param(
     [string]$WsusServer = '',
     [switch]$AutoElevate
 )
-$Script:version = '0.3 (23 Nov 2026)'
+$Script:version = '0.4 (23 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -101,6 +103,34 @@ foreach ($cand in $candidates) {
 if (-not $script:WorkDir) { throw 'Cannot create a writable working folder (tried the script folder, ProgramData and LOCALAPPDATA).' }
 $script:PortableMode = ($script:WorkDir -eq $PSScriptRoot)
 $script:LogFile = Join-Path $script:WorkDir 'WinManUpdateTool1.log'
+$script:SettingsFile = Join-Path $script:WorkDir 'settings.json'
+
+# --- User settings (settings.json in the working folder) ---
+# Load settings.json into a hashtable (empty when missing or unreadable)
+function Get-SavedSettings {
+    $s = @{}
+    try {
+        if (Test-Path -LiteralPath $script:SettingsFile -PathType Leaf) {
+            $obj = Get-Content -LiteralPath $script:SettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($p in $obj.PSObject.Properties) { $s[$p.Name] = [string]$p.Value }
+        }
+    } catch { }
+    return $s
+}
+# Save settings to settings.json, merged over the current file content
+function Save-Settings {
+    param([hashtable]$Values)
+    try {
+        $s = Get-SavedSettings
+        foreach ($key in $Values.Keys) { $s[$key] = $Values[$key] }
+        ConvertTo-Json -InputObject $s -Depth 4 | Set-Content -LiteralPath $script:SettingsFile -Encoding UTF8
+    } catch {
+        Add-GuiLog ('Failed to save settings.json: {0}' -f $_.Exception.Message)
+    }
+}
+# An explicit -WsusServer parameter wins; otherwise restore the saved value
+$script:SavedSettings = Get-SavedSettings
+if ([string]::IsNullOrWhiteSpace($WsusServer) -and $script:SavedSettings.ContainsKey('wsusServer')) { $WsusServer = [string]$script:SavedSettings['wsusServer'] }
 
 # State shared with the background runspace
 $script:sync = [hashtable]::Synchronized(@{})
@@ -117,6 +147,7 @@ $script:sync.UninstallDone = $false
 $script:sync.RebootNeeded = $false
 $script:sync.Result = @()
 $script:sync.InstalledList = @()
+$script:sync.InstalledOk = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 
 $script:IsAdmin = Test-IsAdmin
 $script:HaveScanResults = $false
@@ -203,7 +234,7 @@ $script:WorkerScript = {
 
     # Streamed download with progress and cancel support; returns the byte count
     function Invoke-HttpDownload {
-        param([string]$Url, [string]$DestPath, [string]$Label, [double]$Base, [double]$Span)
+        param([string]$Url, [string]$DestPath, [string]$Label, [double]$Base, [double]$Span, [switch]$NoProxy)
         $partPath = "$DestPath.part"
         try {
             Enable-Tls12
@@ -213,6 +244,7 @@ $script:WorkerScript = {
             $req.Timeout = 30000
             $req.ReadWriteTimeout = 180000
             $req.AllowAutoRedirect = $true
+            if ($NoProxy) { $req.Proxy = $null }   # intranet WSUS: bypass the system proxy
             $resp = $req.GetResponse()
             try {
                 $in = $resp.GetResponseStream()
@@ -249,13 +281,14 @@ $script:WorkerScript = {
 
     # True - the server reports a newer version of the file (or the check failed, so re-download is the safe choice); False - 304 / date not newer than the local file
     function Test-RemoteNewer {
-        param([string]$Url, [datetime]$LocalUtc)
+        param([string]$Url, [datetime]$LocalUtc, [switch]$NoProxy)
         try {
             Enable-Tls12
             $req = [System.Net.HttpWebRequest]::Create($Url)
             $req.Method = 'HEAD'
             $req.Timeout = 20000
             $req.AllowAutoRedirect = $true
+            if ($NoProxy) { $req.Proxy = $null }   # intranet WSUS: bypass the system proxy
             $r = $req.GetResponse()
             try {
                 $srv = [DateTime]::MinValue
@@ -281,12 +314,40 @@ $script:WorkerScript = {
             $req.Method = 'HEAD'
             $req.Timeout = 10000
             $req.AllowAutoRedirect = $true
+            $req.Proxy = $null    # intranet WSUS: never route the probe through the system proxy
             $r = $req.GetResponse()
             try { return ([int]$r.StatusCode -eq 200) } finally { $r.Close() }
         } catch [System.Net.WebException] {
             if ($_.Exception.Response) { return $false }
             throw
         } catch { throw }
+    }
+
+    # WSUS reachability probe: any HTTP answer (200/301/403/404...) means the contact was established; only a transport-level failure (DNS, TCP, timeout, proxy) means unreachable. Returns @{ Online = <bool>; Detail = <HTTP status or error text> }
+    function Test-WsusServerOnline {
+        param([string]$BaseUrl)
+        $res = @{ Online = $false; Detail = '' }
+        if ($BaseUrl -like '\\*') {
+            try { $res.Online = (Test-Path -LiteralPath $BaseUrl) } catch { $res.Detail = $_.Exception.Message }
+            if ($res.Online) { $res.Detail = 'share accessible' } elseif ($res.Detail -eq '') { $res.Detail = 'share not accessible' }
+            return $res
+        }
+        try {
+            Enable-Tls12
+            $req = [System.Net.HttpWebRequest]::Create($BaseUrl)
+            $req.Method = 'HEAD'
+            $req.Timeout = 10000
+            $req.AllowAutoRedirect = $false
+            $req.Proxy = $null    # intranet WSUS: never route the probe through the system proxy
+            $r = $req.GetResponse()
+            try { $res.Online = $true; $res.Detail = ('HTTP {0}' -f [int]$r.StatusCode) } finally { $r.Close() }
+        } catch [System.Net.WebException] {
+            if ($_.Exception.Response) { $res.Online = $true; $res.Detail = ('HTTP {0}' -f [int]$_.Exception.Response.StatusCode) }
+            else { $res.Detail = ('{0} [{1}]' -f $_.Exception.Message, $_.Exception.Status) }
+        } catch {
+            $res.Detail = $_.Exception.Message
+        }
+        return $res
     }
 
     # Normalize the WSUS source once: accept http(s)://server[:8530][/Content] or a UNC path to WSUSContent
@@ -412,7 +473,7 @@ $script:WorkerScript = {
                     $hex = '0x{0:X8}' -f ($Code -band 0xFFFFFFFF)
                     $txt = ('error {0}' -f $hex)
                     if ($hex -eq '0x800F081E') { $txt = 'package is not applicable to this system (0x800F081E)' }
-                if ($hex -eq '0x80070667') { $txt = 'invalid command line for this installer (0x80070667, Win32 1639)' }
+                    if ($hex -eq '0x80070667') { $txt = 'invalid command line for this installer (0x80070667, Win32 1639)' }
                     if ($hex -eq '0x80240020') { $txt = 'installation canceled by the agent (0x80240020); try wusa without /quiet to see the reason' }
                 }
                 $info.Text = $txt
@@ -554,7 +615,15 @@ $script:WorkerScript = {
     function Invoke-Download {
         if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
         $wsusBase = Get-WsusBase
-        if ($wsusBase -ne '') { Write-Log ('WSUS download source enabled: {0} (missing files fall back to the Internet CDN).' -f $wsusBase) } else { Write-Log 'Downloading from the Internet CDN.' }
+        if ($wsusBase -ne '') {
+            Write-Log ('WSUS download source enabled: {0} (missing files fall back to the Internet CDN).' -f $wsusBase)
+            $probe = Test-WsusServerOnline -BaseUrl $wsusBase
+            if ($probe.Online) { Write-Log ('WSUS contact established, the server answered: {0}.' -f $probe.Detail) }
+            else {
+                Write-Log ('WSUS server did not answer: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $probe.Detail)
+                $wsusBase = ''
+            }
+        } else { Write-Log 'Downloading from the Internet CDN.' }
         $totalItems = @($Selected).Count
         $idx = 0
         foreach ($uuid in $Selected) {
@@ -585,7 +654,7 @@ $script:WorkerScript = {
                 if ($wsusBase -ne '') {
                     $ws = $null
                     try { $ws = Resolve-WsusSource -Url $url } catch {
-                        Write-Log 'WSUS server is unreachable - disabling the WSUS source for this run and downloading from the Internet CDN.'
+                        Write-Log ('WSUS probe failed: {0} - disabling the WSUS source for this run and downloading from the Internet CDN.' -f $_.Exception.Message)
                         $wsusBase = ''
                     }
                     if ($ws) {
@@ -594,7 +663,7 @@ $script:WorkerScript = {
                         $script:wsusStyle = $ws.Style
                         $srcName = 'WSUS'
                     } elseif ($wsusBase -ne '') {
-                        Write-Log ('{0}: {1} was not found on the WSUS server - falling back to the Internet CDN.' -f $it.KB, $name)
+                        Write-Log ('{0}: WSUS contact OK, but {1} is not in its store (the update is most likely not approved/downloaded on that WSUS) - falling back to the Internet CDN.' -f $it.KB, $name)
                     }
                 }
                 if (Test-Path -LiteralPath $dest) {
@@ -603,7 +672,7 @@ $script:WorkerScript = {
                         continue
                     }
                     Set-Progress ($base + $span * 0.5) ('{0}: checking {1}' -f $it.KB, $name)
-                    if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc)) {
+                    if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq 'WSUS'))) {
                         Write-Log ('{0}: {1} already downloaded and up to date - skipping.' -f $it.KB, $name)
                         continue
                     }
@@ -616,7 +685,7 @@ $script:WorkerScript = {
                     $bytes = (Get-Item -LiteralPath $dest).Length
                 } else {
                     Write-Log ('{0}: downloading {1} from {2}' -f $it.KB, $name, $srcName)
-                    $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span
+                    $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq 'WSUS')
                 }
                 Write-Log ('{0}: saved {1} ({2:N1} MB)' -f $it.KB, $name, ($bytes / 1MB))
             }
@@ -741,6 +810,8 @@ $script:WorkerScript = {
             elseif ($itemOk -gt 0 -and $sync.RebootNeeded) { $statTxt = 'Installed, reboot required' }
             elseif ($itemOk -gt 0) { $statTxt = 'Installed' }
             Set-ItemStatus $uuid $statTxt
+            # Remember items installed without errors to uncheck them in the GUI afterwards
+            if ($itemOk -gt 0 -and $itemErr -eq 0) { $sync.InstalledOk.Enqueue([string]$uuid) }
         }
         Write-Log 'Install: all selected updates processed.'
     }
@@ -1003,6 +1074,18 @@ function Receive-WorkerFinished {
         $sync.UninstallDone = $false
         Add-GuiLog 'Press [Refresh list] to see the current state of installed updates.'
     }
+    # Uncheck updates that were installed without errors
+    $okIds = @()
+    $tmp = $null
+    while ($sync.InstalledOk.TryDequeue([ref]$tmp)) { $okIds += $tmp }
+    foreach ($k in $okIds) {
+        $lvi = $script:ItemMap[$k]
+        if ($lvi -and $lvi.Checked) {
+            $lvi.Checked = $false
+            Add-GuiLog ('{0}: unchecked (installed successfully).' -f $lvi.Text)
+        }
+    }
+
     if ($sync.RebootNeeded) {
         $sync.RebootNeeded = $false
         $ans = [System.Windows.Forms.MessageBox]::Show($form, "The operation finished, but a reboot is required.`n`nReboot the computer now (in 30 seconds)?", 'Reboot required', 'YesNo', 'Question')
@@ -1130,11 +1213,15 @@ $btnOpenDir.AutoSize = $true
 $btnCancelOp = New-Object System.Windows.Forms.Button
 $btnCancelOp.Text = 'Cancel'
 $btnCancelOp.AutoSize = $true
+$btnAbout = New-Object System.Windows.Forms.Button
+$btnAbout.Text = 'About'
+$btnAbout.AutoSize = $true
 $panelButtons.Controls.Add($btnScan, 0, 0)
 $panelButtons.Controls.Add($btnDownload, 1, 0)
 $panelButtons.Controls.Add($btnInstall, 2, 0)
 $panelButtons.Controls.Add($btnMarkAll, 3, 0)
 $panelButtons.Controls.Add($btnClearAll, 4, 0)
+$panelButtons.Controls.Add($btnAbout, 5, 0)
 $panelButtons.Controls.Add($btnOpenDir, 6, 0)
 $panelButtons.Controls.Add($btnCancelOp, 7, 0)
 
@@ -1289,6 +1376,37 @@ $btnCancelOp.Add_Click({
         Add-GuiLog 'Cancellation requested: it takes effect between files/packages (the WUA scan itself cannot be interrupted).'
     })
 
+# About dialog: project info plus a clickable GitHub link
+$btnAbout.Add_Click({
+        $about = New-Object System.Windows.Forms.Form
+        $about.Text = 'About'
+        $about.FormBorderStyle = 'FixedDialog'
+        $about.StartPosition = 'CenterParent'
+        $about.Size = New-Object System.Drawing.Size(520, 260)
+        $about.MaximizeBox = $false
+        $about.MinimizeBox = $false
+        $about.ShowInTaskbar = $false
+        $about.Font = $form.Font
+        $txt = New-Object System.Windows.Forms.Label
+        $txt.Location = New-Object System.Drawing.Point(12, 12)
+        $txt.Size = New-Object System.Drawing.Size(480, 150)
+        $txt.Text = ("Windows Manual Update Offline Tool One`nVersion: {0}`nAuthor: Andrew Afanasiev (AfanasievAA@yandex.ru)`n`nManual update install/uninstall manager for Windows without automatic updates: offline scan against a local wsusscn2.cab catalog, download (Internet CDN or a WSUS server), local install via wusa/DISM/msiexec, uninstall.`n`nProject page:" -f $Script:version)
+        [void]$about.Controls.Add($txt)
+        $link = New-Object System.Windows.Forms.LinkLabel
+        $link.Location = New-Object System.Drawing.Point(12, 160)
+        $link.Size = New-Object System.Drawing.Size(480, 22)
+        $link.Text = 'https://github.com/AfanasievAA/WinManUpdateTool1'
+        $link.Add_LinkClicked({ try { Start-Process ('https://github.com/AfanasievAA/WinManUpdateTool1') | Out-Null } catch { } })
+        [void]$about.Controls.Add($link)
+        $btnOk = New-Object System.Windows.Forms.Button
+        $btnOk.Text = 'OK'
+        $btnOk.DialogResult = 'OK'
+        $btnOk.Location = New-Object System.Drawing.Point(415, 190)
+        [void]$about.Controls.Add($btnOk)
+        $about.AcceptButton = $btnOk
+        [void]$about.ShowDialog($form)
+    })
+
 $btnRefreshInst.Add_Click({ [void](Start-Worker -Mode 'ListInstalled') })
 
 $btnUninstall.Add_Click({
@@ -1317,6 +1435,8 @@ $form.Add_FormClosing({
 
 $form.Add_FormClosed({
         Receive-LogQueue
+        # Persist the WSUS source (and future settings) to settings.json on exit
+        Save-Settings @{ wsusServer = ([string]$txtWsus.Text).Trim() }
     })
 
 # --- State polling timer (GUI thread) ---
@@ -1361,17 +1481,27 @@ $timer.Add_Tick({
 
 #  Startup
 Add-GuiLog ('WU Offline Tool started. PowerShell: {0}' -f $PSVersionTable.PSVersion.ToString())
+# Caption plus the exact build number (UBR comes from the registry, not from WMI)
 $osName = ''
-try { $osName = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).Caption } catch { $osName = [Environment]::OSVersion.VersionString }
+$osBuild = ''
+try {
+    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $osName = $os.Caption
+    $osBuild = $os.BuildNumber
+    $ubr = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).UBR
+    if ($ubr) { $osBuild = ('{0}.{1}' -f $osBuild, $ubr) }
+} catch { $osName = [Environment]::OSVersion.VersionString; $osBuild = [Environment]::OSVersion.Version.ToString() }
 $adminTxt = 'no'
 if ($script:IsAdmin) { $adminTxt = 'yes' }
-Add-GuiLog ('OS: {0}; elevated rights: {1}.' -f $osName, $adminTxt)
+Add-GuiLog ('OS: {0}; build: {1}; elevated rights: {2}.' -f $osName, $osBuild, $adminTxt)
 $modeTxt = 'fallback folder (the script folder is not writable)'
 if ($script:PortableMode) { $modeTxt = 'portable mode (next to the script)' }
 Add-GuiLog ('Working folder: {0} - {1}. Update files go to {0}\Updates.' -f $script:WorkDir, $modeTxt)
 Add-GuiLog ('Log file: {0}.' -f $script:LogFile)
 if (-not $script:IsAdmin) {
     Add-GuiLog 'Running without administrator rights: scan and download are available. Restart elevated to install/uninstall.'
+    # Popup warning about the missing admin rights
+    [void][System.Windows.Forms.MessageBox]::Show($form, "The tool is running WITHOUT administrator rights.`n`nScan and download are available, but installing or uninstalling updates requires elevation.`n`nRestart the tool elevated (e.g. with -AutoElevate) to enable install/uninstall.", 'WU Offline Tool', 'OK', 'Warning')
 }
 Add-GuiLog 'Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected].'
 
