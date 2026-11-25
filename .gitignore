@@ -1,5 +1,5 @@
 install-state.json
 WinManUpdateTool1.log
 updates/
-WinManUpdateTool1.ps1
 settings.json
+download-queue.json

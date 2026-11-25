@@ -4,11 +4,12 @@
 
 .DESCRIPTION
     Self-contained PowerShell tool with a WinForms that does not depend on a working windows update service
-      1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers.
+      1. Offline scan - searches for missing updates against a local wsusscn2.cab catalog via the Windows Update Agent API (ServerSelection = ssOthers), without contacting WSUS or Microsoft Update servers. Requires administrator rights: the scan registers its offline scan package in the Windows Update service store (HKLM), so the button is disabled without elevation.
       2. Download - fetches update files by direct URLs taken from DownloadContents/BundledUpdates (Microsoft CDN). A file whose name carries the embedded SHA-1 digest (the same digest WSUS keys its content store on) is verified against it: an intact file already on disk is reused as is with no network round-trips (delete the Updates folder or the KB subfolder to force a re-download), a corrupt or truncated one is re-downloaded (up to 3 attempts) and never left on disk; files whose name carries no digest fall back to server-side date checks. Optionally, files can be pulled from a local WSUS server instead (see .PARAMETER WsusServer).
       3. Install - applies packages locally depending on type: .msu via wusa.exe /quiet /norestart; .cab via DISM after an "Applicable" check and /Add-Package /IgnoreCheck; .msi via msiexec /qn /norestart; .exe with "/q /norestart" (ndp*/ofv*/2553065), "/q" with an automatic "/qn /norestart" retry (MSRT kb890830: its package wraps an MSI that rejects the bare /q with 1639) or "/q /z" (other exe installers); non-CBS Office cabs are extracted and their .msp payloads applied via msiexec /p. Exit codes 3010/1641/3017 mean a reboot is required. Note: .msu installation via wusa needs the wuauserv service running (no WSUS connectivity needed), while .cab installation via DISM works even with the update agent disabled.
       4. Uninstall - wusa.exe /uninstall /kb:N and, additionally, DISM /Remove-Package for Package_for_* service packages that wusa usually cannot remove on Windows 10/11.
       5. Cleanup - reclaims disk space after the installed updates are tested: removes superseded components from the WinSxS store via DISM /StartComponentCleanup (the engine behind the Disk Cleanup item "Windows Update Cleanup"; with /ResetBase updates become permanent), clears the Windows Update caches (SoftwareDistribution\Download, Delivery Optimization) and deletes the update files downloaded by this tool (the wsusscn2.cab catalog copy is kept).
+      6. Download queue - updates found by the offline scan can be added to a persistent queue (the "Download queue" tab). The queue is saved to download-queue.json in the working folder on every change and on exit, so it travels with the portable project folder. On a computer WITH Internet access the tool can be opened without administrator rights and the whole queue downloaded with one button: the queued items carry their direct file URLs (Microsoft CDN or the configured WSUS source), so no catalog and no scan are needed there - the files land in the same Updates\KB_XXXXXXXX subfolders as a local download would. Copy the folder back to the target computer, run [Scan (offline)] again - the downloaded updates are recognized ("files already downloaded") - and [Install selected]. Downloading the queue never re-fetches files that are already in the Updates folder with a matching SHA-1 checksum; the [Force re-download] button re-fetches the whole queue from scratch and overwrites the existing copies. Note: the offline scan itself needs administrator rights (scan package registration in the Windows Update service store), so the offline computer is used with elevation - the unelevated mode is meant for the online computer's downloads.
     WSUS download mode (optional): a WSUS server stores update files in its content store (IIS virtual directory "Content" -> WSUSContent folder) as Content/<hash[0:2]>/<hash>.<ext>, where the 40-hex <hash> is the SHA1 hash of the file - the same hash that is embedded in the Microsoft CDN file name. When a WSUS source is configured, the tool maps each CDN URL to the matching WSUS content path, probes it (HTTP HEAD or UNC Test-Path), and downloads from there; if a file is missing on the WSUS server (e.g. the update is not approved/downloaded there), the tool falls back to the Internet CDN automatically. The scan itself always remains offline (local wsusscn2.cab).
 
 .PARAMETER WorkDir
@@ -20,33 +21,42 @@
 .PARAMETER WsusServer
     Optional download source: http://<server>[:8530][/Content] or a UNC path to the WSUS content folder (e.g. \\wsus\wsus$\WSUSContent). Can also be typed in the GUI. Empty (default) = download from the Internet CDN. The GUI value is saved to settings.json in the working folder on exit and restored on the next start; an explicit -WsusServer parameter overrides the saved value.
 
+.PARAMETER NoElevate
+    Start without asking for administrator rights: the elevation dialog and the automatic UAC relaunch are skipped and the tool runs with user rights - the download queue and file downloads work, while the offline scan (its scan package registration writes to HKLM), install, uninstall and cleanup stay disabled (they need elevation). Without this switch a dialog at startup offers the choice: Yes - relaunch elevated (UAC prompt), No - continue unelevated.
+
 .PARAMETER AutoElevate
-    Legacy switch with no effect: the tool now always relaunches itself elevated (UAC prompt) at startup when started with user rights. Kept for backward compatibility with existing shortcuts.
+    Legacy switch with no effect: kept for backward compatibility with existing shortcuts. When started with user rights the tool offers the elevation choice in a startup dialog (Yes - relaunch elevated, No - continue unelevated); -NoElevate skips the dialog and always continues unelevated.
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1 -CatalogPath "\\srv\wsus\wsusscn2.cab" -WsusServer "http://wsus:8530"
+
+.EXAMPLE
+    # On the computer with Internet access: fill the queue on the offline PC first, then download it here without elevation
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WinManUpdateTool1.ps1 -NoElevate
 .NOTES
   Author:         Andrew Afanasiev
   Contacts:       AfanasievAA@yandex.ru
   https://github.com/AfanasievAA/WinManUpdateTool1
 
-    Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].
+    Workflow on the target computer: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].
+    Offline -> online workflow (two computers): on the OFFLINE computer run [Scan (offline)], mark the needed updates and press [Add checked to queue]; close the tool (the queue is saved to download-queue.json in the project folder); move the whole project folder to a computer WITH Internet access; start the tool there WITHOUT elevation (answer "No" in the startup dialog or use -NoElevate); on the "Download queue" tab press [Download queue] - the files land in the Updates subfolder; move the Updates folder (or the whole project folder) back to the target computer; run [Scan (offline)] again - the downloaded updates are recognized as "files already downloaded" - and [Install selected].
     The first run needs Internet access once to fetch wsusscn2.cab (400-600 MB) unless a local copy or a share path is provided.
     The offline scan usually takes 5-40 minutes and cannot be interrupted (a WUA COM limitation).
     Target systems: Windows 10/11, Windows PowerShell 5.1 (built into the OS).
-    The tool needs administrator rights for its operations, so it relaunches itself elevated (UAC prompt) at startup when started with user rights, and it restarts itself on an STA thread for the WinForms GUI.
+    Install/uninstall/cleanup AND the offline scan need administrator rights (the scan registers its scan package in the Windows Update service store, which writes to HKLM): when started with user rights the tool offers the elevation choice in a startup dialog (Yes - relaunch elevated via UAC, No - continue without elevation, then the scan, install, uninstall and cleanup are disabled while the download queue and file downloads work); -NoElevate skips the dialog and never elevates. The tool restarts itself on an STA thread for the WinForms GUI.
 #>
 #Requires -Version 5.1
 param(
     [string]$WorkDir = '',
     [string]$CatalogPath = '',
     [string]$WsusServer = '',
+    [switch]$NoElevate,
     [switch]$AutoElevate
 )
-$Script:version = '0.6 (23 Nov 2026)'
+$Script:version = '0.7 (25 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -71,6 +81,7 @@ $script:ModeInstall = 'Install'
 $script:ModeListInstalled = 'ListInstalled'
 $script:ModeUninstall = 'Uninstall'
 $script:ModeCleanup = 'Cleanup'
+$script:ModeDownloadQueue = 'DownloadQueue'
 # registry path for the OS build (CurrentBuild + UBR)
 $script:RegOsBuild = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 
@@ -101,15 +112,33 @@ function Restart-ScriptHost {
     else { Start-Process -FilePath $hostExe -ArgumentList $argLine | Out-Null }
 }
 
-# The tool has no useful unelevated mode (wusa/DISM/msiexec and service control need admin rights): relaunch itself elevated right at startup when started with user rights; WUOT_ELEVATED guards against a relaunch loop should the elevation not stick
-if (-not (Test-IsAdmin) -and -not $env:WUOT_ELEVATED) {
-    $env:WUOT_ELEVATED = '1'
-    try {
-        Restart-ScriptHost -Elevate
-    } catch {
-        Write-Warning ('Elevated launch was canceled or failed: {0}' -f $_.Exception.Message)
+# Administrator rights: install/uninstall/cleanup need elevation, while the offline scan, the download queue and file downloads work unelevated. When started with user rights: -NoElevate continues unelevated right away; otherwise a startup dialog asks - Yes relaunches the tool elevated (UAC, WUOT_ELEVATED guards against a relaunch loop should the elevation not stick), No continues without elevation (WUOT_UNELEVATED remembers the "No" across the STA relaunch, which does not forward -NoElevate).
+if (-not (Test-IsAdmin) -and -not $env:WUOT_ELEVATED -and -not $env:WUOT_UNELEVATED) {
+    $wantElevate = $true
+    if ($NoElevate) {
+        $wantElevate = $false
+        $env:WUOT_UNELEVATED = '1'
+    } else {
+        try { Add-Type -AssemblyName System.Windows.Forms } catch { }
+        try {
+            $ans = [System.Windows.Forms.MessageBox]::Show($null, "Start WITH administrator rights?`n`nYes - relaunch elevated (UAC prompt): full functionality - offline scan, install, uninstall, cleanup.`nNo - continue WITHOUT elevation: the download queue and file downloads work; the offline scan (needs elevation - it registers a scan package in the Windows Update service store), install, uninstall and cleanup are disabled.`n`n(The -NoElevate switch skips this dialog.)", 'WU Offline Tool', 'YesNo', 'Question', [System.Windows.Forms.MessageBoxDefaultButton]::Button1)
+            if ($ans -eq [System.Windows.Forms.DialogResult]::No) {
+                $wantElevate = $false
+                $env:WUOT_UNELEVATED = '1'
+            }
+        } catch {
+            # no interactive desktop available - keep the legacy behavior (auto-elevate)
+        }
     }
-    return
+    if ($wantElevate) {
+        $env:WUOT_ELEVATED = '1'
+        try {
+            Restart-ScriptHost -Elevate
+            return
+        } catch {
+            Write-Warning ('Elevated launch was canceled or failed: {0} - continuing without elevation.' -f $_.Exception.Message)
+        }
+    }
 }
 
 # Relaunch on a fresh STA thread when the host thread is not STA (WinForms requirement), once; a child of an elevated process stays elevated, so this restart does not lose the elevation
@@ -141,9 +170,9 @@ if (-not $script:WorkDir) { throw 'Cannot create a writable working folder (trie
 $script:PortableMode = ($script:WorkDir -eq $PSScriptRoot)
 $script:LogFile = Join-Path $script:WorkDir 'WinManUpdateTool1.log'
 $script:SettingsFile = Join-Path $script:WorkDir 'settings.json'
+$script:QueueFile = Join-Path $script:WorkDir 'download-queue.json'
 
 # --- User settings (settings.json in the working folder) ---
-# Load settings.json into a hashtable (empty when missing or unreadable)
 function Get-SavedSettings {
     $s = @{}
     try {
@@ -181,6 +210,7 @@ $script:sync.ProgressText = ''
 $script:sync.ScanDone = $false
 $script:sync.InstalledDone = $false
 $script:sync.UninstallDone = $false
+$script:sync.QueueDlDone = $false
 $script:sync.RebootNeeded = $false
 $script:sync.Result = @()
 $script:sync.InstalledList = @()
@@ -227,7 +257,96 @@ function Enable-LvDoubleBuffer {
     } catch { }
 }
 
-#  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, ResetBase, IsAdmin, CatalogUrl, SearchCriteria, CancelMsg, plus the shared constants (exit codes, source names, worker modes)
+# --- Download queue (persistent, shared between computers via download-queue.json in the working folder) ---
+$script:DownloadQueue = @()     # array of item hashtables: UUID, KB, Title, Description, SizeMB, Date, Reboot, Urls, DirName, AddedAt
+$script:QueueMap = @{}          # UUID -> ListViewItem of the "Download queue" tab (live status updates from the worker)
+$script:ItemStatusBase = @{}    # UUID -> base status text of the available-updates row (the " [queued]" marker is appended to it)
+
+# File name from a URL: the fileName query parameter first, then the last path segment, URL-decoded, invalid chars stripped (GUI-side copy of the worker's helper - the worker runspace cannot see GUI functions)
+function Get-UrlFileName {
+    param([string]$Url)
+    $name = ''
+    try {
+        $u = [Uri]$Url
+        # Microsoft CDN URLs often carry the real file name in the fileName query parameter (.../files/<guid>?fileName=<name>_<sha1>.<ext>) instead of the path
+        $q = $u.Query
+        if ($q -match '(?i)[?&]fileName=([^&]+)') { $name = [Uri]::UnescapeDataString($Matches[1]) }
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $name = [Uri]::UnescapeDataString($u.Segments[$u.Segments.Count - 1])
+            $name = $name.TrimEnd('/')
+        }
+    } catch { }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $name = 'file_' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    }
+    foreach ($c in @('\', '/', ':', '*', '?', '"', '<', '>', '|')) { $name = $name.Replace($c, '_') }
+    return $name
+}
+
+# Read download-queue.json into an array of item hashtables (empty when missing or unreadable)
+function Get-SavedQueue {
+    $list = @()
+    try {
+        if (Test-Path -LiteralPath $script:QueueFile -PathType Leaf) {
+            $obj = Get-Content -LiteralPath $script:QueueFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($e in @($obj)) {
+                if (-not $e) { continue }
+                $urls = @()
+                try { foreach ($u in @($e.urls)) { if ($u) { $urls += [string]$u } } } catch { }
+                $sizeMb = 0.0
+                try { $sizeMb = [math]::Round([double]$e.sizeMB, 1) } catch { }
+                $list += @{
+                    UUID = [string]$e.uuid; KB = [string]$e.kb; Title = [string]$e.title
+                    Description = [string]$e.description; SizeMB = $sizeMb; Date = [string]$e.date
+                    Reboot = [string]$e.reboot; Urls = $urls; DirName = [string]$e.dirName
+                    AddedAt = [string]$e.addedAt
+                }
+            }
+        }
+    } catch {
+        Add-GuiLog ('Failed to load download-queue.json: {0}' -f $_.Exception.Message)
+    }
+    return , $list
+}
+
+# Write the current queue to download-queue.json (called on every queue change and on exit); the file travels with the portable project folder
+function Save-Queue {
+    try {
+        $arr = @()
+        foreach ($it in $script:DownloadQueue) {
+            $arr += [pscustomobject]@{
+                uuid = [string]$it.UUID; kb = [string]$it.KB; title = [string]$it.Title
+                description = [string]$it.Description; sizeMB = $it.SizeMB; date = [string]$it.Date
+                reboot = [string]$it.Reboot; dirName = [string]$it.DirName
+                addedAt = [string]$it.AddedAt
+                urls = @($it.Urls | ForEach-Object { [string]$_ })
+            }
+        }
+        if ($arr.Count -eq 0) {
+            Set-Content -LiteralPath $script:QueueFile -Value '[]' -Encoding UTF8
+        } else {
+            ConvertTo-Json -InputObject @($arr) -Depth 5 | Set-Content -LiteralPath $script:QueueFile -Encoding UTF8
+        }
+    } catch {
+        Add-GuiLog ('Failed to save download-queue.json: {0}' -f $_.Exception.Message)
+    }
+}
+
+# Folder name of a queue item inside Updates: the stored DirName, or rebuilt from KB + UUID prefix the way the offline scan named it
+function Get-QueueDirName {
+    param($It)
+    $dn = [string]$It.DirName
+    if ([string]::IsNullOrWhiteSpace($dn)) {
+        $uuid = [string]$It.UUID
+        if ($uuid.Length -ge 8) { $dn = '{0}_{1}' -f $It.KB, $uuid.Substring(0, 8) } else { $dn = [string]$It.KB }
+    }
+    return $dn
+}
+
+# Load the queue saved by a previous session (it was filled on this or another computer and travels with the project folder)
+$script:DownloadQueue = Get-SavedQueue
+
+#  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, ResetBase, IsAdmin, QueueItems, CatalogUrl, SearchCriteria, CancelMsg, plus the shared constants (exit codes, source names, worker modes)
 $script:WorkerScript = {
     $counters = @{ Psf = 0 }
     $script:wsusStyle = [WsusNameStyle]::Native    # remembered WSUS file-name layout that matched last, speeds up subsequent files
@@ -253,14 +372,19 @@ $script:WorkerScript = {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
     }
 
-    # File name from a URL: last path segment, URL-decoded, invalid chars stripped
+    # File name from a URL: the fileName query parameter first, then the last path segment, URL-decoded, invalid chars stripped
     function Get-UrlFileName {
         param([string]$Url)
         $name = ''
         try {
             $u = [Uri]$Url
-            $name = [Uri]::UnescapeDataString($u.Segments[$u.Segments.Count - 1])
-            $name = $name.TrimEnd('/')
+            # Microsoft CDN URLs often carry the real file name in the fileName query parameter (.../files/<guid>?fileName=<name>_<sha1>.<ext>) instead of the path
+            $q = $u.Query
+            if ($q -match '(?i)[?&]fileName=([^&]+)') { $name = [Uri]::UnescapeDataString($Matches[1]) }
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $name = [Uri]::UnescapeDataString($u.Segments[$u.Segments.Count - 1])
+                $name = $name.TrimEnd('/')
+            }
         } catch { }
         if ([string]::IsNullOrWhiteSpace($name)) {
             $name = 'file_' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -643,6 +767,7 @@ $script:WorkerScript = {
             }
             $rec = [pscustomobject]@{
                 kb = $KB; file = $FilePath; method = $Method; identity = $Identity; exit = $ExitCode
+                machine = $env:COMPUTERNAME
                 at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
             }
             $state = @($state) + $rec
@@ -652,8 +777,7 @@ $script:WorkerScript = {
         }
     }
 
-    # MODE: Offline scan
-    # Enumerate missing updates against the local wsusscn2.cab catalog
+    # MODE: Offline scan. Enumerate missing updates against the local wsusscn2.cab catalog
     function Invoke-Scan {
         Write-Status 'Preparing the catalog...'
         Set-Progress 0 'Checking wsusscn2.cab'
@@ -731,10 +855,8 @@ $script:WorkerScript = {
         Write-Log 'Done. Mark the needed updates and run [Download selected].'
     }
 
-    # Download files of the selected updates (WSUS source first, then Internet CDN)
-    function Invoke-Download {
-        if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
-        # download-source state shared by all files of this run: WsusBase = the normalized WSUS content root ('' when disabled/unreachable), SkipWsus = the current file is known to be absent from the WSUS store
+    # Download-source state shared by all files of one run: WsusBase = the normalized WSUS content root ('' when disabled/unreachable), SkipWsus = the current file is known to be absent from the WSUS store
+    function Initialize-DownloadState {
         $dlState = @{ WsusBase = (Get-WsusBase); SkipWsus = $false }
         if ($dlState.WsusBase -ne '') {
             Write-Log ('WSUS download source enabled: {0} (missing files fall back to the Internet CDN).' -f $dlState.WsusBase)
@@ -745,6 +867,116 @@ $script:WorkerScript = {
                 $dlState.WsusBase = ''
             }
         } else { Write-Log 'Downloading from the Internet CDN.' }
+        return $dlState
+    }
+
+    # Download all files of one update item (hashtable with UUID, KB, Urls, Dir); returns the number of failed files, or -1 when the item has no direct URLs at all. Shared by [Download selected] (items from the scan results) and [Download queue] (items from download-queue.json).
+    function Invoke-UpdateFilesDownload {
+        param([hashtable]$Item, [int]$Index, [int]$Total, [hashtable]$DlState)
+        $uuid = [string]$Item.UUID
+        if (-not $Item.Urls -or @($Item.Urls).Count -eq 0) {
+            Set-ItemStatus $uuid 'No direct file URL'
+            Write-Log ('{0}: no direct URLs for its files - skipped.' -f $Item.KB)
+            return -1
+        }
+        if (-not (Test-Path -LiteralPath $Item.Dir)) { New-Item -ItemType Directory -Path $Item.Dir -Force | Out-Null }
+        $urls = @($Item.Urls)
+        $fcount = $urls.Count
+        $fi = 0
+        $itemFail = 0
+        foreach ($url in $urls) {
+            if ($sync.Cancel) { throw $CancelMsg }
+            $fi++
+            $name = Get-UrlFileName $url
+            $dest = Join-Path $Item.Dir $name
+            $base = (($Index - 1) + (($fi - 1) / $fcount)) / $Total
+            $span = (1.0 / $fcount) / $Total
+            # expected SHA-1 digest: the one embedded in the CDN/WSUS file name (the WSUS store copy is byte-identical, so it matches both sources)
+            $nameHash = Get-FileNameHash $name
+            $bytes = -1
+            $fileOk = $false
+            $DlState.SkipWsus = $false
+            # fast path (skipped by [Force re-download]): the file is on disk and its bytes match the SHA-1 pinned in its name, so it is exactly what this URL serves - reuse it as is, no probe, no server check (delete the Updates folder or the KB subfolder to force a re-download)
+            if (-not $ForceRedl -and $nameHash -and (Test-Path -LiteralPath $dest) -and (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
+                Write-Log ('{0}: {1} already downloaded - checksum verified, skipping.' -f $Item.KB, $name)
+                continue
+            }
+            # up to 3 attempts per file: corrupt/truncated downloads and transient network errors are retried, a broken file is never left on disk
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                # choose the download source: WSUS first when configured (unless it proved empty for this file), Internet otherwise
+                $dl = Get-DownloadSource -Url $url -State $DlState -KB $Item.KB -Name $name
+                $dlUrl = $dl.Url
+                $dlUnc = $dl.Unc
+                $srcName = $dl.Source
+                $needFetch = $true
+                if ($ForceRedl) {
+                    # [Force re-download]: fetch again even when an intact copy exists. The fresh data is written to a .part file and replaces the old copy (Move-Item -Force) only after the full download
+                    # succeeded, so a failed attempt keeps the previous file on disk.
+                    if (Test-Path -LiteralPath $dest) { Write-Log ('{0}: {1} - forced re-download, the existing copy is replaced only after a successful fetch.' -f $Item.KB, $name) }
+                } elseif (Test-Path -LiteralPath $dest) {
+                    # reuse a present file only when it passes the integrity check - protects against corrupt leftovers of earlier runs
+                    if (-not (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
+                        Write-Log ('{0}: {1} is present but corrupt (SHA-1 check failed) - re-downloading.' -f $Item.KB, $name)
+                        Remove-Item -LiteralPath $dest -Force
+                    } elseif ($dlUnc) {
+                        Write-Log ('{0}: {1} already downloaded - skipping.' -f $Item.KB, $name)
+                        $needFetch = $false
+                    } else {
+                        Set-Progress ($base + $span * 0.5) ('{0}: checking {1}' -f $Item.KB, $name)
+                        if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq $SrcWsus))) {
+                            Write-Log ('{0}: {1} already downloaded and up to date - skipping.' -f $Item.KB, $name)
+                            $needFetch = $false
+                        } else {
+                            Write-Log ('{0}: {1} - a newer version exists on the server, re-downloading.' -f $Item.KB, $name)
+                            Remove-Item -LiteralPath $dest -Force
+                        }
+                    }
+                }
+                if (-not $needFetch) { $fileOk = $true; break }
+                Set-ItemStatus $uuid ('Downloading {0}/{1}: {2}' -f $fi, $fcount, $name)
+                try {
+                    if ($dlUnc) {
+                        Write-Log ('{0}: copying {1} from WSUS share' -f $Item.KB, $name)
+                        Copy-Item -LiteralPath $dlUrl -Destination $dest -Force
+                        $bytes = (Get-Item -LiteralPath $dest).Length
+                    } else {
+                        Write-Log ('{0}: downloading {1} from {2}' -f $Item.KB, $name, $srcName)
+                        $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $Item.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq $SrcWsus)
+                    }
+                } catch {
+                    if ($_.Exception.Message -eq $CancelMsg) { throw }
+                    Write-Log ('{0}: downloading {1} from {2} failed: {3}' -f $Item.KB, $name, $srcName, $_.Exception.Message)
+                    $bytes = 0
+                }
+                if (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash) { $fileOk = $true; break }
+                # the saved data is garbage: often a small HTML/XML error page (proxy or captive portal) - recognize it to log a clear hint
+                if (Test-Path -LiteralPath $dest) {
+                    $isHtml = $false
+                    try {
+                        $fs = [System.IO.File]::OpenRead($dest)
+                        try { $isHtml = ($fs.ReadByte() -eq 0x3C) } finally { $fs.Dispose() }
+                    } catch { }
+                    if ($isHtml) { Write-Log ('{0}: {1} from {2} is an HTML/XML page, not the package (proxy or captive-portal interference?) - retrying.' -f $Item.KB, $name, $srcName) }
+                    else { Write-Log ('{0}: {1} from {2} fails the SHA-1 integrity check (expected {3}) - retrying.' -f $Item.KB, $name, $srcName, $nameHash) }
+                    Remove-Item -LiteralPath $dest -Force
+                }
+                if ($srcName -eq $SrcWsus) { $DlState.SkipWsus = $true }
+            }
+            if (-not $fileOk) {
+                $itemFail++
+                Set-ItemStatus $uuid ('Download failed: {0}' -f $name)
+                Write-Log ('{0}: {1} could not be downloaded intact after 3 attempts - skipped.' -f $Item.KB, $name)
+                continue
+            }
+            if ($bytes -ge 0) { Write-Log ('{0}: saved {1} ({2:N1} MB)' -f $Item.KB, $name, ($bytes / 1MB)) }
+        }
+        return $itemFail
+    }
+
+    # Download files of the selected updates from the scan results (WSUS source first, then Internet CDN)
+    function Invoke-Download {
+        if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
+        $dlState = Initialize-DownloadState
         $totalItems = @($Selected).Count
         $idx = 0
         foreach ($uuid in $Selected) {
@@ -753,110 +985,58 @@ $script:WorkerScript = {
             foreach ($cand in $sync.Result) { if ($cand.UUID -eq $uuid) { $it = $cand; break } }
             if (-not $it) { continue }
             $idx++
-            if (-not $it.Urls -or $it.Urls.Count -eq 0) {
-                Set-ItemStatus $uuid 'No direct file URL'
-                Write-Log ('{0}: no direct URLs for its files - skipped.' -f $it.KB)
-                continue
-            }
-            if (-not (Test-Path -LiteralPath $it.Dir)) { New-Item -ItemType Directory -Path $it.Dir -Force | Out-Null }
-            $fcount = $it.Urls.Count
-            $fi = 0
-            $itemFail = 0
-            foreach ($url in $it.Urls) {
-                if ($sync.Cancel) { throw $CancelMsg }
-                $fi++
-                $name = Get-UrlFileName $url
-                $dest = Join-Path $it.Dir $name
-                $base = (($idx - 1) + (($fi - 1) / $fcount)) / $totalItems
-                $span = (1.0 / $fcount) / $totalItems
-                # expected SHA-1 digest: the one embedded in the CDN/WSUS file name (the WSUS store copy is byte-identical, so it matches both sources)
-                $nameHash = Get-FileNameHash $name
-                $bytes = -1
-                $fileOk = $false
-                $dlState.SkipWsus = $false
-                # fast path: the file is on disk and its bytes match the SHA-1 pinned in its name, so it is exactly what this URL serves - reuse it as is, no probe, no server check (delete the Updates folder or the KB subfolder to force a re-download)
-                if ($nameHash -and (Test-Path -LiteralPath $dest) -and (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
-                    Write-Log ('{0}: {1} already downloaded - checksum verified, skipping.' -f $it.KB, $name)
-                    continue
-                }
-                # up to 3 attempts per file: corrupt/truncated downloads and transient network errors are retried, a broken file is never left on disk
-                for ($attempt = 1; $attempt -le 3; $attempt++) {
-                    # choose the download source: WSUS first when configured (unless it proved empty for this file), Internet otherwise
-                    $dl = Get-DownloadSource -Url $url -State $dlState -KB $it.KB -Name $name
-                    $dlUrl = $dl.Url
-                    $dlUnc = $dl.Unc
-                    $srcName = $dl.Source
-                    $needFetch = $true
-                    if (Test-Path -LiteralPath $dest) {
-                        # reuse a present file only when it passes the integrity check - protects against corrupt leftovers of earlier runs
-                        if (-not (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash)) {
-                            Write-Log ('{0}: {1} is present but corrupt (SHA-1 check failed) - re-downloading.' -f $it.KB, $name)
-                            Remove-Item -LiteralPath $dest -Force
-                        } elseif ($dlUnc) {
-                            Write-Log ('{0}: {1} already downloaded - skipping.' -f $it.KB, $name)
-                            $needFetch = $false
-                        } else {
-                            Set-Progress ($base + $span * 0.5) ('{0}: checking {1}' -f $it.KB, $name)
-                            if (-not (Test-RemoteNewer -Url $dlUrl -LocalUtc (Get-Item -LiteralPath $dest).LastWriteTimeUtc -NoProxy:($srcName -eq $SrcWsus))) {
-                                Write-Log ('{0}: {1} already downloaded and up to date - skipping.' -f $it.KB, $name)
-                                $needFetch = $false
-                            } else {
-                                Write-Log ('{0}: {1} - a newer version exists on the server, re-downloading.' -f $it.KB, $name)
-                                Remove-Item -LiteralPath $dest -Force
-                            }
-                        }
-                    }
-                    if (-not $needFetch) { $fileOk = $true; break }
-                    Set-ItemStatus $uuid ('Downloading {0}/{1}: {2}' -f $fi, $fcount, $name)
-                    try {
-                        if ($dlUnc) {
-                            Write-Log ('{0}: copying {1} from WSUS share' -f $it.KB, $name)
-                            Copy-Item -LiteralPath $dlUrl -Destination $dest -Force
-                            $bytes = (Get-Item -LiteralPath $dest).Length
-                        } else {
-                            Write-Log ('{0}: downloading {1} from {2}' -f $it.KB, $name, $srcName)
-                            $bytes = Invoke-HttpDownload -Url $dlUrl -DestPath $dest -Label ('{0}: {1}' -f $it.KB, $name) -Base $base -Span $span -NoProxy:($srcName -eq $SrcWsus)
-                        }
-                    } catch {
-                        if ($_.Exception.Message -eq $CancelMsg) { throw }
-                        Write-Log ('{0}: downloading {1} from {2} failed: {3}' -f $it.KB, $name, $srcName, $_.Exception.Message)
-                        $bytes = 0
-                    }
-                    if (Test-FileIntegrity -Path $dest -ExpectedHash $nameHash) { $fileOk = $true; break }
-                    # the saved data is garbage: often a small HTML/XML error page (proxy or captive portal) - recognize it to log a clear hint
-                    if (Test-Path -LiteralPath $dest) {
-                        $isHtml = $false
-                        try {
-                            $fs = [System.IO.File]::OpenRead($dest)
-                            try { $isHtml = ($fs.ReadByte() -eq 0x3C) } finally { $fs.Dispose() }
-                        } catch { }
-                        if ($isHtml) { Write-Log ('{0}: {1} from {2} is an HTML/XML page, not the package (proxy or captive-portal interference?) - retrying.' -f $it.KB, $name, $srcName) }
-                        else { Write-Log ('{0}: {1} from {2} fails the SHA-1 integrity check (expected {3}) - retrying.' -f $it.KB, $name, $srcName, $nameHash) }
-                        Remove-Item -LiteralPath $dest -Force
-                    }
-                    if ($srcName -eq $SrcWsus) { $dlState.SkipWsus = $true }
-                }
-                if (-not $fileOk) {
-                    $itemFail++
-                    Set-ItemStatus $uuid ('Download failed: {0}' -f $name)
-                    Write-Log ('{0}: {1} could not be downloaded intact after 3 attempts - skipped.' -f $it.KB, $name)
-                    continue
-                }
-                if ($bytes -ge 0) { Write-Log ('{0}: saved {1} ({2:N1} MB)' -f $it.KB, $name, ($bytes / 1MB)) }
-            }
-            if ($itemFail -gt 0) {
-                Set-ItemStatus $uuid ('Downloaded with errors ({0} file(s) failed)' -f $itemFail)
+            $fail = Invoke-UpdateFilesDownload -Item $it -Index $idx -Total $totalItems -DlState $dlState
+            if ($fail -lt 0) { continue }
+            if ($fail -gt 0) {
+                Set-ItemStatus ([string]$it.UUID) ('Downloaded with errors ({0} file(s) failed)' -f $fail)
                 Write-Log ('{0}: download finished with errors.' -f $it.KB)
             } else {
-                Set-ItemStatus $uuid 'Downloaded - ready to install'
+                Set-ItemStatus ([string]$it.UUID) 'Downloaded - ready to install'
                 Write-Log ('{0}: download finished.' -f $it.KB)
             }
         }
         Write-Log 'Download: all selected updates processed.'
     }
 
-    #  MODE: Install selected
-    # Apply downloaded packages (msu/cab/exe/msi) to the local system
+    # MODE: Download queue - download the updates collected in download-queue.json. Used on a computer WITH Internet access: the queue was filled on the offline target computer and each item carries its direct CDN/WSUS file URLs, so no catalog and no scan are needed here (this mode works without administrator rights). The files land in the same Updates\<KB>_<uuid8> subfolders the offline computer names them by, so after copying the folder back and re-scanning there the updates are recognized as already downloaded and can be installed.
+    function Invoke-DownloadQueue {
+        $queueItems = @($QueueItems)
+        if ($queueItems.Count -eq 0) { Write-Log 'The download queue is empty - nothing to download.'; return }
+        Write-Log ('Download queue: {0} item(s) queued in download-queue.json.' -f $queueItems.Count)
+        $dlState = Initialize-DownloadState
+        $updatesDir = Join-Path $WorkDir 'Updates'
+        $totalItems = $queueItems.Count
+        $idx = 0
+        $doneOk = 0
+        $doneFail = 0
+        foreach ($it in $queueItems) {
+            if ($sync.Cancel) { throw $CancelMsg }
+            $idx++
+            # resolve the item folder exactly the way the offline computer named it: Updates\<KB>_<uuid8>
+            $dirName = [string]$it.DirName
+            if ([string]::IsNullOrWhiteSpace($dirName)) {
+                $uuidStr = [string]$it.UUID
+                if ($uuidStr.Length -ge 8) { $dirName = '{0}_{1}' -f $it.KB, $uuidStr.Substring(0, 8) } else { $dirName = [string]$it.KB }
+            }
+            $it.Dir = Join-Path $updatesDir $dirName
+            $fail = Invoke-UpdateFilesDownload -Item $it -Index $idx -Total $totalItems -DlState $dlState
+            if ($fail -gt 0) {
+                $doneFail++
+                Set-ItemStatus ([string]$it.UUID) ('Downloaded with errors ({0} file(s) failed)' -f $fail)
+                Write-Log ('{0}: download finished with errors.' -f $it.KB)
+            } elseif ($fail -eq 0) {
+                $doneOk++
+                Set-ItemStatus ([string]$it.UUID) 'Downloaded - copy the Updates folder to the target computer'
+                Write-Log ('{0}: download finished.' -f $it.KB)
+            } else {
+                $doneFail++
+            }
+        }
+        $sync.QueueDlDone = $true
+        Write-Log ('Download queue: finished. {0} item(s) fully downloaded, {1} with problems. Copy the Updates folder to the target computer and run [Scan (offline)] there.' -f $doneOk, $doneFail)
+    }
+
+    #  MODE: Install selected. Apply downloaded packages (msu/cab/exe/msi) to the local system
     function Invoke-Install {
         if (-not $IsAdmin) { throw 'Installation requires administrator rights. Restart the tool elevated.' }
         if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
@@ -913,8 +1093,7 @@ $script:WorkerScript = {
                     Write-Log ('{0}: checking applicability via DISM: {1}' -f $it.KB, $file.Name)
                     $cabInfo = Test-CabApplicable -CabPath $file.FullName
                     if (-not $cabInfo.Ok) {
-                        # DISM cannot open non-CBS cabs (exit code 2): Office-family updates are cab containers with .msp payloads.
-                        # Extract the patches and apply them with msiexec /p instead of skipping the update.
+                        # DISM cannot open non-CBS cabs (exit code 2): Office-family updates are cab containers with .msp payloads. Extract the patches and apply them with msiexec /p instead of skipping the update.
                         $mspDir = Join-Path $file.DirectoryName ($file.BaseName + '.msp')
                         if (Test-Path -LiteralPath $mspDir) { Remove-Item -LiteralPath $mspDir -Recurse -Force }
                         New-Item -ItemType Directory -Path $mspDir -Force | Out-Null
@@ -1028,7 +1207,6 @@ $script:WorkerScript = {
         return $Identity
     }
 
-    # MODE: List installed updates
     # Build the installed-updates list from QFE and DISM data
     function Invoke-ListInstalled {
         Write-Status 'Collecting the list of installed updates...'
@@ -1070,8 +1248,7 @@ $script:WorkerScript = {
         Write-Status ''
     }
 
-    # MODE: Uninstall selected
-    # Remove the selected QFE entries (wusa) and DISM packages
+    # MODE: Uninstall selected. Remove the selected QFE entries (wusa) and DISM packages
     function Invoke-Uninstall {
         if (-not $IsAdmin) { throw 'Uninstallation requires administrator rights. Restart the tool elevated.' }
         if (@($UninstallSel).Count -eq 0) { Write-Log 'Nothing selected for uninstall.'; return }
@@ -1113,9 +1290,7 @@ $script:WorkerScript = {
         Write-Log 'Uninstall: operation finished.'
     }
 
-    # MODE: Cleanup leftovers of installed updates (run after the updates are tested)
-    # Reclaims disk space: 1) superseded components in the WinSxS store via DISM /StartComponentCleanup - the engine behind the Disk Cleanup item "Windows Update Cleanup" (with $ResetBase also /ResetBase - afterwards updates can no longer be uninstalled);
-    # 2) Windows Update caches: SoftwareDistribution\Download (wuauserv/bits are stopped and restored to their previous state) and Delivery Optimization; 3) update files downloaded by this tool (wsusscn2.cab is kept)
+    # MODE: Cleanup leftovers of installed updates (run after the updates are tested).  Reclaims disk space: 1) superseded components in the WinSxS store via DISM /StartComponentCleanup - the engine behind the Disk Cleanup item "Windows Update Cleanup" (with $ResetBase also /ResetBase - afterwards updates can no longer be uninstalled); 2) Windows Update caches: SoftwareDistribution\Download (wuauserv/bits are stopped and restored to their previous state) and Delivery Optimization; 3) update files downloaded by this tool (wsusscn2.cab is kept)
     function Invoke-Cleanup {
         if (-not $IsAdmin) { throw 'Cleanup requires administrator rights. Restart the tool elevated.' }
         $freeBefore = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace
@@ -1185,6 +1360,7 @@ $script:WorkerScript = {
             $ModeListInstalled { Invoke-ListInstalled }
             $ModeUninstall { Invoke-Uninstall }
             $ModeCleanup { Invoke-Cleanup }
+            $ModeDownloadQueue { Invoke-DownloadQueue }
         }
     } catch {
         if ($_.Exception.Message -eq $CancelMsg) {
@@ -1199,10 +1375,9 @@ $script:WorkerScript = {
     }
 }
 
-#  GUI-thread functions: worker launch, list population, completion handling
-# Launch the background runspace for the given mode and selections
+#  GUI-thread functions: worker launch, list population, completion handling Launch the background runspace for the given mode and selections
 function Start-Worker {
-    param([string]$Mode, [string[]]$Selected = @(), [string[]]$UninstallSel = @(), [bool]$ResetBase = $false)
+    param([string]$Mode, [string[]]$Selected = @(), [string[]]$UninstallSel = @(), [bool]$ResetBase = $false, [bool]$ForceRedl = $false)
     if ($sync.Busy) {
         Show-GuiMsg 'An operation is already running, please wait until it finishes.'
         return $false
@@ -1212,6 +1387,7 @@ function Start-Worker {
     $sync.ScanDone = $false
     $sync.InstalledDone = $false
     $sync.UninstallDone = $false
+    $sync.QueueDlDone = $false
     $sync.RebootNeeded = $false
     $sync.Status = ''
     $sync.Progress = 0
@@ -1227,13 +1403,15 @@ function Start-Worker {
     $rs.SessionStateProxy.SetVariable('WsusServer', ([string]$txtWsus.Text).Trim())
     $rs.SessionStateProxy.SetVariable('Selected', ([string[]]@($Selected)))
     $rs.SessionStateProxy.SetVariable('UninstallSel', ([string[]]@($UninstallSel)))
+    $rs.SessionStateProxy.SetVariable('QueueItems', @($script:DownloadQueue))
+    $rs.SessionStateProxy.SetVariable('ForceRedl', [bool]$ForceRedl)
     $rs.SessionStateProxy.SetVariable('ResetBase', $ResetBase)
     $rs.SessionStateProxy.SetVariable('IsAdmin', $script:IsAdmin)
     $rs.SessionStateProxy.SetVariable('CatalogUrl', $script:CatalogUrl)
     $rs.SessionStateProxy.SetVariable('SearchCriteria', $script:SearchCriteria)
     $rs.SessionStateProxy.SetVariable('CancelMsg', $script:CancelMsg)
     # hand the shared constants (exit codes, source names, worker modes) to the worker runspace
-    foreach ($cn in 'ExitRebootRequired', 'ExitRebootRequiredAlt', 'ExitRebootInitiated', 'ExitAlreadyInstalled', 'ExitBadCommandLine', 'SrcInternet', 'SrcWsus', 'ModeGetCatalog', 'ModeScan', 'ModeDownload', 'ModeInstall', 'ModeListInstalled', 'ModeUninstall', 'ModeCleanup') { $rs.SessionStateProxy.SetVariable($cn, (Get-Variable -Name $cn -Scope Script).Value) }
+    foreach ($cn in 'ExitRebootRequired', 'ExitRebootRequiredAlt', 'ExitRebootInitiated', 'ExitAlreadyInstalled', 'ExitBadCommandLine', 'SrcInternet', 'SrcWsus', 'ModeGetCatalog', 'ModeScan', 'ModeDownload', 'ModeInstall', 'ModeListInstalled', 'ModeUninstall', 'ModeCleanup', 'ModeDownloadQueue') { $rs.SessionStateProxy.SetVariable($cn, (Get-Variable -Name $cn -Scope Script).Value) }
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript($script:WorkerScript.ToString())
@@ -1262,6 +1440,7 @@ function Update-UpdatesList {
     $lvUpdates.BeginUpdate()
     $lvUpdates.Items.Clear()
     $script:ItemMap.Clear()
+    $script:ItemStatusBase.Clear()
     foreach ($it in $sync.Result) {
         $lvi = New-Object System.Windows.Forms.ListViewItem([string]$it.KB)
         [void]$lvi.SubItems.Add([string]$it.Title)
@@ -1272,6 +1451,7 @@ function Update-UpdatesList {
         if ($it.DownloadedAll) { $status = 'files already downloaded' }
         elseif ($it.Note) { $status = $it.Note }
         [void]$lvi.SubItems.Add($status)
+        $script:ItemStatusBase[[string]$it.UUID] = $status
         $lvi.Tag = [string]$it.UUID
         $lvi.Checked = ($it.Urls.Count -gt 0)
         if ($it.Urls.Count -eq 0) { $lvi.ForeColor = [System.Drawing.Color]::Gray }
@@ -1280,6 +1460,7 @@ function Update-UpdatesList {
         $script:ItemMap[[string]$it.UUID] = $lvi
     }
     $lvUpdates.EndUpdate()
+    Update-QueueMarkers
     $tabs.SelectedTab = $tabUpdates
     Add-GuiLog ('Update list: {0} entries. Checked by default are the ones with direct download URLs.' -f $sync.Result.Count)
 }
@@ -1301,6 +1482,54 @@ function Update-InstalledList {
     Add-GuiLog ('Installed updates list: {0} entries.' -f $sync.InstalledList.Count)
 }
 
+# Fill the download-queue list from the persistent queue (download-queue.json)
+function Update-QueueList {
+    $lvQueue.BeginUpdate()
+    $lvQueue.Items.Clear()
+    $script:QueueMap.Clear()
+    $updatesDir = Join-Path $script:WorkDir 'Updates'
+    foreach ($it in $script:DownloadQueue) {
+        $dir = Join-Path $updatesDir (Get-QueueDirName $it)
+        $urls = @($it.Urls)
+        $total = $urls.Count
+        $have = 0
+        foreach ($u in $urls) {
+            if (Test-Path -LiteralPath (Join-Path $dir (Get-UrlFileName ([string]$u)))) { $have++ }
+        }
+        $lvi = New-Object System.Windows.Forms.ListViewItem([string]$it.KB)
+        [void]$lvi.SubItems.Add([string]$it.Title)
+        [void]$lvi.SubItems.Add([string]$it.SizeMB)
+        [void]$lvi.SubItems.Add([string]$it.Date)
+        [void]$lvi.SubItems.Add(('{0}/{1}' -f $have, $total))
+        $status = 'waiting for download'
+        if ($total -eq 0) { $status = 'no direct file URL' }
+        elseif ($have -eq $total) { $status = 'files already downloaded' }
+        # a final status of the last download run (if this item took part in it) wins over the computed one
+        if ($sync.ItemStatus.ContainsKey([string]$it.UUID)) { $status = [string]$sync.ItemStatus[[string]$it.UUID] }
+        [void]$lvi.SubItems.Add($status)
+        $lvi.Tag = [string]$it.UUID
+        if ($it.Description) { $lvi.ToolTipText = $it.Description }
+        [void]$lvQueue.Items.Add($lvi)
+        $script:QueueMap[[string]$it.UUID] = $lvi
+    }
+    $lvQueue.EndUpdate()
+    $lblQueueHint.Text = ('In queue: {0} (saved to download-queue.json)' -f $script:DownloadQueue.Count)
+}
+
+# Append/remove the " [queued]" marker on the available-updates rows
+function Update-QueueMarkers {
+    $queued = @{}
+    foreach ($q in $script:DownloadQueue) { $queued[[string]$q.UUID] = $true }
+    foreach ($key in @($script:ItemMap.Keys)) {
+        $lvi = $script:ItemMap[$key]
+        if (-not $lvi) { continue }
+        $txt = ''
+        if ($script:ItemStatusBase.ContainsKey([string]$key)) { $txt = [string]$script:ItemStatusBase[[string]$key] }
+        if ($queued.ContainsKey([string]$key)) { $txt = if ($txt) { '{0} [queued]' -f $txt } else { '[queued]' } }
+        $lvi.SubItems[5].Text = $txt
+    }
+}
+
 # Handle completion of the background runspace (populate lists, prompt for reboot)
 function Receive-WorkerFinished {
     if ($sync.ScanDone) {
@@ -1316,6 +1545,11 @@ function Receive-WorkerFinished {
     if ($sync.UninstallDone) {
         $sync.UninstallDone = $false
         Add-GuiLog 'Press [Refresh list] to see the current state of installed updates.'
+    }
+    if ($sync.QueueDlDone) {
+        $sync.QueueDlDone = $false
+        Update-QueueList
+        $tabs.SelectedTab = $tabQueue
     }
     # Uncheck updates that were installed without errors
     $okIds = @()
@@ -1411,12 +1645,22 @@ $lblWsusHint = New-Object System.Windows.Forms.Label
 $lblWsusHint.Text = 'empty = Internet CDN'
 $lblWsusHint.TextAlign = 'MiddleLeft'
 $lblWsusHint.Dock = 'Fill'
+$lblWsusHint.AutoEllipsis = $true
 $lblWsusHint.ForeColor = [System.Drawing.Color]::Gray
 $toolTip = New-Object System.Windows.Forms.ToolTip
 $toolTip.SetToolTip($txtWsus, "WSUS download source, used for DOWNLOADS only (the scan always stays offline).`nExamples: http://wsus:8530  |  http://wsus  |  \\wsus\wsus$\WSUSContent`nFiles missing on the WSUS server are automatically downloaded from the Internet instead.")
 $panelWsus.Controls.Add($lblWsus, 0, 0)
 $panelWsus.Controls.Add($txtWsus, 1, 0)
 $panelWsus.Controls.Add($lblWsusHint, 2, 0)
+
+# Align the WSUS input width with the catalog input: the hint label column gets the same trailing width the catalog row spends on its two buttons, so both text boxes are equally wide at any window size (measured once after the form is shown, when the AutoSize button widths are known)
+$form.Add_Shown({
+        $trail = $btnBrowse.Width + $btnCatalogDl.Width + 6
+        if ($trail -gt 60) {
+            $panelWsus.ColumnStyles[2] = New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, $trail)
+            $panelWsus.PerformLayout()
+        }
+    })
 
 # --- Row 3: action buttons ---
 $panelButtons = New-Object System.Windows.Forms.TableLayoutPanel
@@ -1439,6 +1683,7 @@ $panelButtons.Padding = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
 $btnScan = New-Object System.Windows.Forms.Button
 $btnScan.Text = 'Scan (offline)'
 $btnScan.AutoSize = $true
+$toolTip.SetToolTip($btnScan, "Offline scan against the local wsusscn2.cab catalog.`nRequires administrator rights: the scan registers its offline scan package in the Windows Update service store (HKLM).")
 $btnDownload = New-Object System.Windows.Forms.Button
 $btnDownload.Text = 'Download selected'
 $btnDownload.AutoSize = $true
@@ -1451,11 +1696,11 @@ $btnMarkAll.AutoSize = $true
 $btnClearAll = New-Object System.Windows.Forms.Button
 $btnClearAll.Text = 'Unmark all'
 $btnClearAll.AutoSize = $true
- $btnCleanup = New-Object System.Windows.Forms.Button
- $btnCleanup.Text = 'Cleanup leftovers'
- $btnCleanup.AutoSize = $true
- $btnOpenDir = New-Object System.Windows.Forms.Button
- $btnOpenDir.Text = 'Folder'
+$btnCleanup = New-Object System.Windows.Forms.Button
+$btnCleanup.Text = 'Cleanup leftovers'
+$btnCleanup.AutoSize = $true
+$btnOpenDir = New-Object System.Windows.Forms.Button
+$btnOpenDir.Text = 'Folder'
 $btnOpenDir.AutoSize = $true
 $btnCancelOp = New-Object System.Windows.Forms.Button
 $btnCancelOp.Text = 'Cancel'
@@ -1468,9 +1713,9 @@ $panelButtons.Controls.Add($btnDownload, 1, 0)
 $panelButtons.Controls.Add($btnInstall, 2, 0)
 $panelButtons.Controls.Add($btnMarkAll, 3, 0)
 $panelButtons.Controls.Add($btnClearAll, 4, 0)
- $panelButtons.Controls.Add($btnCleanup, 5, 0)
- $panelButtons.Controls.Add($btnOpenDir, 6, 0)
- $panelButtons.Controls.Add($btnCancelOp, 7, 0)
+$panelButtons.Controls.Add($btnCleanup, 5, 0)
+$panelButtons.Controls.Add($btnOpenDir, 6, 0)
+$panelButtons.Controls.Add($btnCancelOp, 7, 0)
 $panelButtons.Controls.Add($btnAbout, 8, 0)
 
 # --- Tabs ---
@@ -1480,6 +1725,8 @@ $tabUpdates = New-Object System.Windows.Forms.TabPage
 $tabUpdates.Text = 'Available updates'
 $tabInstalled = New-Object System.Windows.Forms.TabPage
 $tabInstalled.Text = 'Installed (uninstall)'
+$tabQueue = New-Object System.Windows.Forms.TabPage
+$tabQueue.Text = 'Download queue'
 
 $lvUpdates = New-Object System.Windows.Forms.ListView
 $lvUpdates.Dock = 'Fill'
@@ -1499,7 +1746,31 @@ $colSize.TextAlign = 'Right'
 [void]$lvUpdates.Columns.Add('Reboot', 105)
 [void]$lvUpdates.Columns.Add('Status / files', 260)
 Enable-LvDoubleBuffer $lvUpdates
+
+# Queue button above the available-updates list: adds the checked updates to the persistent download queue
+$panelUpd = New-Object System.Windows.Forms.TableLayoutPanel
+$panelUpd.Dock = 'Top'
+$panelUpd.Height = 34
+$panelUpd.ColumnCount = 2
+$panelUpd.RowCount = 1
+$panelUpd.Padding = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
+[void]$panelUpd.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$panelUpd.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$panelUpd.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent, 100)))
+$btnAddQueue = New-Object System.Windows.Forms.Button
+$btnAddQueue.Text = 'Add checked to queue'
+$btnAddQueue.AutoSize = $true
+$lblUpdHint = New-Object System.Windows.Forms.Label
+$lblUpdHint.Text = 'Queue the checked updates for downloading on another (online) computer - see the "Download queue" tab.'
+$lblUpdHint.TextAlign = 'MiddleLeft'
+$lblUpdHint.Dock = 'Fill'
+$lblUpdHint.ForeColor = [System.Drawing.Color]::Gray
+$toolTip.SetToolTip($btnAddQueue, "Adds the checked updates to the persistent download queue (download-queue.json).`nUse this on the OFFLINE computer: the scan finds the updates, the queue stores their direct download URLs, and the files are fetched later on a computer with Internet access ([Download queue] on the next tab).")
+$panelUpd.Controls.Add($btnAddQueue, 0, 0)
+$panelUpd.Controls.Add($lblUpdHint, 1, 0)
+
 [void]$tabUpdates.Controls.Add($lvUpdates)
+[void]$tabUpdates.Controls.Add($panelUpd)
 
 $panelInst = New-Object System.Windows.Forms.TableLayoutPanel
 $panelInst.Dock = 'Top'
@@ -1539,8 +1810,70 @@ Enable-LvDoubleBuffer $lvInstalled
 [void]$tabInstalled.Controls.Add($lvInstalled)
 [void]$tabInstalled.Controls.Add($panelInst)
 
+# --- Download queue tab: the queue filled on the offline computer, downloaded on the online one ---
+$panelQueue = New-Object System.Windows.Forms.TableLayoutPanel
+$panelQueue.Dock = 'Top'
+$panelQueue.Height = 34
+$panelQueue.ColumnCount = 5
+$panelQueue.RowCount = 1
+$panelQueue.Padding = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
+[void]$panelQueue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$panelQueue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$panelQueue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$panelQueue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$panelQueue.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$panelQueue.RowStyles.Add((New-Object System.Windows.Forms.RowStyle -ArgumentList ([System.Windows.Forms.SizeType]::Percent, 100)))
+$btnQueueDl = New-Object System.Windows.Forms.Button
+$btnQueueDl.Text = 'Download queue'
+$btnQueueDl.AutoSize = $true
+$btnQueueRemove = New-Object System.Windows.Forms.Button
+$btnQueueRemove.Text = 'Remove selected'
+$btnQueueRemove.AutoSize = $true
+$btnQueueClear = New-Object System.Windows.Forms.Button
+$btnQueueClear.Text = 'Clear queue'
+$btnQueueClear.AutoSize = $true
+$btnQueueForce = New-Object System.Windows.Forms.Button
+$btnQueueForce.Text = 'Force re-download'
+$btnQueueForce.AutoSize = $true
+$lblQueueHint = New-Object System.Windows.Forms.Label
+$lblQueueHint.Text = 'In queue: 0'
+$lblQueueHint.TextAlign = 'MiddleLeft'
+$lblQueueHint.Dock = 'Fill'
+$lblQueueHint.ForeColor = [System.Drawing.Color]::Gray
+$toolTip.SetToolTip($btnQueueDl, "Downloads every queued update into the Updates folder from its stored direct URLs (Microsoft CDN or the configured WSUS source).`nRun this on a computer WITH Internet access - no elevation, no catalog and no scan are needed there.`nThe file names and subfolders are the same as on the target computer, so after copying the Updates folder back and re-scanning there the updates are ready to install.")
+$toolTip.SetToolTip($btnQueueRemove, "Removes the checked entries from the queue (already downloaded files stay on disk).`nThe queue is saved to download-queue.json immediately.")
+$toolTip.SetToolTip($btnQueueClear, 'Removes ALL entries from the queue (already downloaded files stay on disk).')
+$toolTip.SetToolTip($btnQueueForce, "Re-downloads ALL queued updates from scratch, even when intact copies (matching SHA-1 checksums) are already in the Updates folder.`nUse this only if you suspect a downloaded file is damaged despite passing the checksum, or when you need fresh copies for sure.`nThe previous copy of a file is overwritten only after the new download finishes successfully, so a failed attempt keeps the old file.")
+$panelQueue.Controls.Add($btnQueueDl, 0, 0)
+$panelQueue.Controls.Add($btnQueueRemove, 1, 0)
+$panelQueue.Controls.Add($btnQueueClear, 2, 0)
+$panelQueue.Controls.Add($btnQueueForce, 3, 0)
+$panelQueue.Controls.Add($lblQueueHint, 4, 0)
+
+$lvQueue = New-Object System.Windows.Forms.ListView
+$lvQueue.Dock = 'Fill'
+$lvQueue.View = 'Details'
+$lvQueue.CheckBoxes = $true
+$lvQueue.FullRowSelect = $true
+$lvQueue.HideSelection = $false
+$lvQueue.ShowItemToolTips = $true
+[void]$lvQueue.Columns.Add('KB', 100)
+[void]$lvQueue.Columns.Add('Update', 420)
+$colQSize = New-Object System.Windows.Forms.ColumnHeader
+$colQSize.Text = 'Size, MB'
+$colQSize.Width = 90
+$colQSize.TextAlign = 'Right'
+[void]$lvQueue.Columns.Add($colQSize)
+[void]$lvQueue.Columns.Add('Date', 85)
+[void]$lvQueue.Columns.Add('Files', 70)
+[void]$lvQueue.Columns.Add('Status / files', 260)
+Enable-LvDoubleBuffer $lvQueue
+[void]$tabQueue.Controls.Add($lvQueue)
+[void]$tabQueue.Controls.Add($panelQueue)
+
 [void]$tabs.TabPages.Add($tabUpdates)
 [void]$tabs.TabPages.Add($tabInstalled)
+[void]$tabs.TabPages.Add($tabQueue)
 
 # --- Log panel ---
 $panelLog = New-Object System.Windows.Forms.Panel
@@ -1626,18 +1959,18 @@ $btnAbout.Add_Click({
         $about.Text = 'About'
         $about.FormBorderStyle = 'FixedDialog'
         $about.StartPosition = 'CenterParent'
-        $about.Size = New-Object System.Drawing.Size(520, 260)
+        $about.Size = New-Object System.Drawing.Size(520, 300)
         $about.MaximizeBox = $false
         $about.MinimizeBox = $false
         $about.ShowInTaskbar = $false
         $about.Font = $form.Font
         $txt = New-Object System.Windows.Forms.Label
         $txt.Location = New-Object System.Drawing.Point(12, 12)
-        $txt.Size = New-Object System.Drawing.Size(480, 150)
-        $txt.Text = ("Windows Manual Update Offline Tool One`nVersion: {0}`nAuthor: Andrew Afanasiev (AfanasievAA@yandex.ru)`n`nManual update install/uninstall manager for Windows without automatic updates: offline scan against a local wsusscn2.cab catalog, download (Internet CDN or a WSUS server), local install via wusa/DISM/msiexec, uninstall.`n`nProject page:" -f $Script:version)
+        $txt.Size = New-Object System.Drawing.Size(480, 195)
+        $txt.Text = ("Windows Manual Update Offline Tool One`nVersion: {0}`nAuthor: Andrew Afanasiev (AfanasievAA@yandex.ru)`n`nManual update install/uninstall manager for Windows without automatic updates: offline scan against a local wsusscn2.cab catalog, download (Internet CDN or a WSUS server), local install via wusa/DISM/msiexec, uninstall, and a persistent download queue for moving update files from an offline to an online computer.`n`nProject page:" -f $Script:version)
         [void]$about.Controls.Add($txt)
         $link = New-Object System.Windows.Forms.LinkLabel
-        $link.Location = New-Object System.Drawing.Point(12, 160)
+        $link.Location = New-Object System.Drawing.Point(12, 215)
         $link.Size = New-Object System.Drawing.Size(480, 22)
         $link.Text = 'https://github.com/AfanasievAA/WinManUpdateTool1'
         $link.Add_LinkClicked({ try { Start-Process ('https://github.com/AfanasievAA/WinManUpdateTool1') | Out-Null } catch { } })
@@ -1645,7 +1978,7 @@ $btnAbout.Add_Click({
         $btnOk = New-Object System.Windows.Forms.Button
         $btnOk.Text = 'OK'
         $btnOk.DialogResult = 'OK'
-        $btnOk.Location = New-Object System.Drawing.Point(415, 190)
+        $btnOk.Location = New-Object System.Drawing.Point(415, 245)
         [void]$about.Controls.Add($btnOk)
         $about.AcceptButton = $btnOk
         [void]$about.ShowDialog($form)
@@ -1662,14 +1995,99 @@ $btnUninstall.Add_Click({
         }
     })
 
- $btnCleanup.Add_Click({
+# Add the checked scan results to the persistent download queue (download-queue.json)
+$btnAddQueue.Add_Click({
+        $sel = Get-CheckedUpdates
+        if ($sel.Count -eq 0) { Show-GuiMsg 'Check the updates you want to add to the download queue first.'; return }
+        $added = 0
+        $refreshed = 0
+        $skipped = 0
+        foreach ($it in $sync.Result) {
+            if ($sel -notcontains [string]$it.UUID) { continue }
+            if (-not $it.Urls -or @($it.Urls).Count -eq 0) {
+                Add-GuiLog ('{0}: has no direct file URLs - it cannot be downloaded on another computer, not queued.' -f $it.KB)
+                $skipped++
+                continue
+            }
+            $entry = @{
+                UUID = [string]$it.UUID; KB = [string]$it.KB; Title = [string]$it.Title
+                Description = [string]$it.Description; SizeMB = $it.SizeMB; Date = [string]$it.Date
+                Reboot = [string]$it.Reboot; Urls = @($it.Urls)
+                DirName = (Split-Path -Leaf ([string]$it.Dir))
+                AddedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            }
+            $existingIdx = -1
+            for ($i = 0; $i -lt $script:DownloadQueue.Count; $i++) {
+                if ([string]$script:DownloadQueue[$i].UUID -eq [string]$it.UUID) { $existingIdx = $i; break }
+            }
+            if ($existingIdx -ge 0) {
+                # the update was scanned again: refresh its stored data (fresh URLs), keep the queue position
+                $script:DownloadQueue[$existingIdx] = $entry
+                $refreshed++
+            } else {
+                $script:DownloadQueue += $entry
+                $added++
+            }
+        }
+        Save-Queue
+        Update-QueueList
+        Update-QueueMarkers
+        Add-GuiLog ('Download queue: {0} added, {1} refreshed (re-scanned), {2} skipped without URLs, total {3}. Saved to {4}.' -f $added, $refreshed, $skipped, $script:DownloadQueue.Count, $script:QueueFile)
+    })
+
+$btnQueueDl.Add_Click({
+        if ($script:DownloadQueue.Count -eq 0) {
+            Show-GuiMsg 'The download queue is empty. On the offline computer scan the updates and press [Add checked to queue], then move the project folder here.'
+            return
+        }
+        [void](Start-Worker -Mode $script:ModeDownloadQueue)
+    })
+
+$btnQueueForce.Add_Click({
+        if ($script:DownloadQueue.Count -eq 0) {
+            Show-GuiMsg 'The download queue is empty. On the offline computer scan the updates and press [Add checked to queue], then move the project folder here.'
+            return
+        }
+        $ans = [System.Windows.Forms.MessageBox]::Show($form, ('Re-download ALL {0} queued updates from scratch, overwriting the existing copies?`n`nUse this only when you suspect a downloaded file is damaged despite passing the checksum check. A failed download keeps the previous file.' -f $script:DownloadQueue.Count), 'Force re-download', 'YesNo', 'Warning')
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        [void](Start-Worker -Mode $script:ModeDownloadQueue -ForceRedl:$true)
+    })
+
+$btnQueueRemove.Add_Click({
+        $sel = @()
+        foreach ($item in $lvQueue.CheckedItems) { $sel += ([string]$item.Tag) }
+        if ($sel.Count -eq 0) { Show-GuiMsg 'Check the queue entries you want to remove first.'; return }
+        $kept = @()
+        foreach ($q in $script:DownloadQueue) {
+            if ($sel -notcontains [string]$q.UUID) { $kept += $q }
+        }
+        $removed = $script:DownloadQueue.Count - $kept.Count
+        $script:DownloadQueue = $kept
+        Save-Queue
+        Update-QueueList
+        Update-QueueMarkers
+        Add-GuiLog ('Download queue: removed {0} item(s), {1} left.' -f $removed, $script:DownloadQueue.Count)
+    })
+
+$btnQueueClear.Add_Click({
+        if ($script:DownloadQueue.Count -eq 0) { return }
+        $ans = [System.Windows.Forms.MessageBox]::Show($form, ('Remove ALL {0} entries from the download queue? (The already downloaded files stay on disk.)' -f $script:DownloadQueue.Count), 'Clear download queue', 'YesNo', 'Question')
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        $script:DownloadQueue = @()
+        Save-Queue
+        Update-QueueList
+        Update-QueueMarkers
+        Add-GuiLog 'Download queue: cleared.'
+    })
+
+$btnCleanup.Add_Click({
         $ans = [System.Windows.Forms.MessageBox]::Show($form, "Clean up update leftovers?`n`n1) Superseded components in the WinSxS store - the Disk Cleanup 'Windows Update Cleanup' engine (DISM /StartComponentCleanup); superseded updates can NO LONGER be uninstalled afterwards.`n2) Windows Update caches (SoftwareDistribution\Download + Delivery Optimization).`n3) Update files downloaded by this tool (wsusscn2.cab is kept).`n`nRun this only after the installed updates are TESTED.", 'Confirm cleanup', 'YesNo', 'Question')
         if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
         $rb = [System.Windows.Forms.MessageBox]::Show($form, "Also run the deep cleanup (/ResetBase)?`n`nIt removes ALL superseded component versions - afterwards NO installed update can be uninstalled at all.", 'Deep cleanup (ResetBase)', 'YesNo', 'Warning', [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
         [void](Start-Worker -Mode $script:ModeCleanup -ResetBase ($rb -eq [System.Windows.Forms.DialogResult]::Yes))
     })
 
- $form.Add_FormClosing({
+$form.Add_FormClosing({
         if ($sync.Busy) {
             $ans = [System.Windows.Forms.MessageBox]::Show($form, 'An operation is still running. Cancel it and exit?', 'WU Offline Tool', 'YesNo', 'Warning')
             if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
@@ -1684,6 +2102,8 @@ $form.Add_FormClosed({
         Receive-LogQueue
         # Persist the WSUS source (and future settings) to settings.json on exit
         Save-Settings @{ wsusServer = ([string]$txtWsus.Text).Trim() }
+        # Persist the download queue: it travels with the project folder to the online computer
+        Save-Queue
     })
 
 # --- State polling timer (GUI thread) ---
@@ -1697,7 +2117,7 @@ $timer.Add_Tick({
         $lblProgress.Text = $sync.ProgressText
 
         $busy = $sync.Busy
-        $btnScan.Enabled = (-not $busy)
+        $btnScan.Enabled = (-not $busy) -and $script:IsAdmin
         $btnDownload.Enabled = (-not $busy) -and $script:HaveScanResults
         $btnInstall.Enabled = (-not $busy) -and $script:HaveScanResults -and $script:IsAdmin
         $btnCatalogDl.Enabled = (-not $busy)
@@ -1706,11 +2126,18 @@ $timer.Add_Tick({
         $btnRefreshInst.Enabled = (-not $busy)
         $btnUninstall.Enabled = (-not $busy) -and $script:HaveInstalledList -and $script:IsAdmin
         $btnCleanup.Enabled = (-not $busy) -and $script:IsAdmin
+        $btnAddQueue.Enabled = (-not $busy) -and $script:HaveScanResults
+        $btnQueueDl.Enabled = (-not $busy)
+        $btnQueueRemove.Enabled = (-not $busy)
+        $btnQueueClear.Enabled = (-not $busy)
+        $btnQueueForce.Enabled = (-not $busy)
 
         if ($sync.ItemStatus.Count -gt 0) {
             foreach ($key in @($sync.ItemStatus.Keys)) {
                 $lvi = $script:ItemMap[$key]
                 if ($lvi) { $lvi.SubItems[5].Text = [string]$sync.ItemStatus[$key] }
+                $lviQ = $script:QueueMap[$key]
+                if ($lviQ) { $lviQ.SubItems[5].Text = [string]$sync.ItemStatus[$key] }
             }
         }
 
@@ -1747,6 +2174,10 @@ if ($script:PortableMode) { $modeTxt = 'portable mode (next to the script)' }
 Add-GuiLog ('Working folder: {0} - {1}. Update files go to {0}\Updates.' -f $script:WorkDir, $modeTxt)
 Add-GuiLog ('Log file: {0}.' -f $script:LogFile)
 Add-GuiLog 'Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].'
+Add-GuiLog 'Offline -> online workflow: [Scan] on the offline PC -> [Add checked to queue] -> move the project folder to an online PC -> [Download queue] -> move the Updates folder back -> [Scan (offline)] -> [Install selected].'
+if (-not $script:IsAdmin) { Add-GuiLog 'Running WITHOUT administrator rights: the offline scan needs elevation too (it registers a scan package in the Windows Update service store), so scan/install/uninstall/cleanup are disabled; the download queue and file downloads work.' }
+if ($script:DownloadQueue.Count -gt 0) { Add-GuiLog ('Download queue: {0} item(s) restored from download-queue.json.' -f $script:DownloadQueue.Count) }
+Update-QueueList
 
 $timer.Start()
 [void]$form.ShowDialog()
