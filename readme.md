@@ -1,8 +1,6 @@
 # WinManUpdateTool1 — Windows Manual Offline Update Tool
-<img width="1282" height="941" alt="image" src="https://github.com/user-attachments/assets/b796778a-e338-4961-b7d9-b459fb008a96" />
 
 **WinManUpdateTool1** is a portable PowerShell + WinForms tool for **searching, downloading, installing, and removing Windows updates manually**, without relying on a running Windows Update service and without contacting Microsoft Update / WSUS servers during scanning. Scanning is performed against a local `wsusscn2.cab` catalog via the Windows Update Agent API (`ServerSelection = ssOthers`). Update files are downloaded directly from the Microsoft CDN (or from a local WSUS store) and installed locally using `wusa.exe` / `DISM` / `msiexec`.
-<img width="1282" height="941" alt="image" src="https://github.com/user-attachments/assets/b796778a-e338-4961-b7d9-b459fb008a96" />
 <img width="1282" height="941" alt="image" src="https://github.com/user-attachments/assets/b796778a-e338-4961-b7d9-b459fb008a96" />
 
 ## ✨ Features
