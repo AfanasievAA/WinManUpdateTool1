@@ -56,7 +56,7 @@ param(
     [switch]$NoElevate,
     [switch]$AutoElevate
 )
-$Script:version = '0.7 (25 Nov 2026)'
+$Script:version = '0.8 (25 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -84,14 +84,6 @@ $script:ModeCleanup = 'Cleanup'
 $script:ModeDownloadQueue = 'DownloadQueue'
 # registry path for the OS build (CurrentBuild + UBR)
 $script:RegOsBuild = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-
-# WSUS content-store file-name layouts probed by Resolve-WsusSource; the integer values are stable and index the candidate list
-enum WsusNameStyle {
-    Native = 0              # <hash>.<ext> - the native WSUS storage name
-    CdnName = 1             # <name>_<hash>.<ext> - the original Microsoft CDN name
-    PublishedConcat = 2     # <hash><name>.<ext> - locally published third-party content
-    PublishedUnderscore = 3 # <hash>_<name>.<ext> - locally published third-party content
-}
 
 # --- Administrator rights ---
 # Return $true when the current process runs elevated
@@ -349,7 +341,12 @@ $script:DownloadQueue = Get-SavedQueue
 #  BACKGROUND WORKER: runs in its own runspace, the GUI never blocks.  Variables are injected via SessionStateProxy: sync, WorkDir, Mode, CatalogFile, WsusServer, Selected, UninstallSel, ResetBase, IsAdmin, QueueItems, CatalogUrl, SearchCriteria, CancelMsg, plus the shared constants (exit codes, source names, worker modes)
 $script:WorkerScript = {
     $counters = @{ Psf = 0 }
-    $script:wsusStyle = [WsusNameStyle]::Native    # remembered WSUS file-name layout that matched last, speeds up subsequent files
+    # WSUS content-store file-name layouts probed by Resolve-WsusSource; the values are stable and index the candidate list. Plain integers instead of a PowerShell enum: an enum defined in the main script is visible only in that (main) runspace, while the worker runs in its own runspace where the type cannot be resolved
+    $WsusStyleNative = 0              # <hash>.<ext> - the native WSUS storage name
+    $WsusStyleCdnName = 1             # <name>_<hash>.<ext> - the original Microsoft CDN name
+    $WsusStylePublishedConcat = 2     # <hash><name>.<ext> - locally published third-party content
+    $WsusStylePublishedUnderscore = 3 # <hash>_<name>.<ext> - locally published third-party content
+    $script:wsusStyle = $WsusStyleNative    # remembered WSUS file-name layout that matched last, speeds up subsequent files
 
     # Queue a log line for the GUI thread
     function Write-Log { param([string]$m) $sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m)) }
@@ -557,7 +554,7 @@ $script:WorkerScript = {
         return ($s + '/Content')
     }
 
-    # Map a Microsoft CDN URL to the WSUS content store layout: Content/<hash[0:2]>/<hash>.<ext>, where <hash> is the 40-hex SHA1 of the file - the same hash that is embedded in the Microsoft CDN file name (WSUS names content files by their SHA1 and keeps the original extension, e.g. Content/9c/9c8ff...d5.msu). Several name layouts exist in the wild (see [WsusNameStyle]); candidates are probed and the working one is remembered. Returns @{ Url = <http url or unc path>; Style = <[WsusNameStyle] member>; Unc = <bool> } or $null when no mapping/probe matched.
+    # Map a Microsoft CDN URL to the WSUS content store layout: Content/<hash[0:2]>/<hash>.<ext>, where <hash> is the 40-hex SHA1 of the file - the same hash that is embedded in the Microsoft CDN file name (WSUS names content files by their SHA1 and keeps the original extension, e.g. Content/9c/9c8ff...d5.msu). Several name layouts exist in the wild (see the $WsusStyle* constants at the top of the worker script); candidates are probed and the working one is remembered. Returns @{ Url = <http url or unc path>; Style = <layout id, one of the $WsusStyle* constants>; Unc = <bool> } or $null when no mapping/probe matched.
     function Resolve-WsusSource {
         param([string]$Url, [string]$Base)
         if ($Base -eq '') { return $null }
@@ -577,22 +574,22 @@ $script:WorkerScript = {
         if (-not $hash) { return $null }
         # candidate store file names per layout style; the style that matched last is probed first
         $names = @{}
-        $names[[int][WsusNameStyle]::Native] = ('{0}.{1}' -f $hash, $ext)
-        $names[[int][WsusNameStyle]::CdnName] = ('{0}_{1}.{2}' -f $pure, $hash, $ext)
-        $names[[int][WsusNameStyle]::PublishedConcat] = ('{0}{1}.{2}' -f $hash, $pure, $ext)
-        $names[[int][WsusNameStyle]::PublishedUnderscore] = ('{0}_{1}.{2}' -f $hash, $pure, $ext)
-        $all = @([int][WsusNameStyle]::Native, [int][WsusNameStyle]::CdnName, [int][WsusNameStyle]::PublishedConcat, [int][WsusNameStyle]::PublishedUnderscore)
+        $names[$WsusStyleNative] = ('{0}.{1}' -f $hash, $ext)
+        $names[$WsusStyleCdnName] = ('{0}_{1}.{2}' -f $pure, $hash, $ext)
+        $names[$WsusStylePublishedConcat] = ('{0}{1}.{2}' -f $hash, $pure, $ext)
+        $names[$WsusStylePublishedUnderscore] = ('{0}_{1}.{2}' -f $hash, $pure, $ext)
+        $all = @($WsusStyleNative, $WsusStyleCdnName, $WsusStylePublishedConcat, $WsusStylePublishedUnderscore)
         $first = [int]$script:wsusStyle
-        if ($all -notcontains $first) { $first = [int][WsusNameStyle]::Native }
+        if ($all -notcontains $first) { $first = $WsusStyleNative }
         $order = @($first) + ($all | Where-Object { $_ -ne $first })
         foreach ($oi in $order) {
             $cand = $names[$oi]
             if ($Base -like '\\*') {
                 $p = Join-Path $Base ($hash.Substring(0, 2) + '\' + $cand)
-                if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Url = $p; Style = [WsusNameStyle]$oi; Unc = $true } }
+                if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Url = $p; Style = $oi; Unc = $true } }
             } else {
                 $u = $Base + '/' + $hash.Substring(0, 2) + '/' + $cand
-                if (Test-HttpUrlExists $u) { return @{ Url = $u; Style = [WsusNameStyle]$oi; Unc = $false } }
+                if (Test-HttpUrlExists $u) { return @{ Url = $u; Style = $oi; Unc = $false } }
             }
         }
         return $null
@@ -2146,6 +2143,8 @@ $timer.Add_Tick({
             try { $null = $w.PS.EndInvoke($w.Handle) } catch {
                 Add-GuiLog ('Background operation error: {0}' -f $_.Exception.Message)
             }
+            # worker statements that failed without aborting the script land only in the error stream (e.g. the startup type-resolution failure) - surface them instead of losing them silently
+            foreach ($er in @($w.PS.Streams.Error)) { Add-GuiLog ('Background operation error: {0}' -f $er.ToString()) }
             try { $w.PS.Dispose() } catch { }
             try { $w.RS.Close() } catch { }
             $script:Worker = $null
