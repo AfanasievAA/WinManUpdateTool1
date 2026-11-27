@@ -41,7 +41,7 @@
   Contacts:       AfanasievAA@yandex.ru
   https://github.com/AfanasievAA/WinManUpdateTool1
 
-    Workflow on the target computer: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].
+    Workflow on the target computer: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers]. The [Scan + Install] button chains the same sequence into one unattended run: it scans, downloads the files that are still missing and installs everything that stays checked.
     Offline -> online workflow (two computers): on the OFFLINE computer run [Scan (offline)], mark the needed updates and press [Add checked to queue]; close the tool (the queue is saved to download-queue.json in the project folder); move the whole project folder to a computer WITH Internet access; start the tool there WITHOUT elevation (answer "No" in the startup dialog or use -NoElevate); on the "Download queue" tab press [Download queue] - the files land in the Updates subfolder; move the Updates folder (or the whole project folder) back to the target computer; run [Scan (offline)] again - the downloaded updates are recognized as "files already downloaded" - and [Install selected].
     The first run needs Internet access once to fetch wsusscn2.cab (400-600 MB) unless a local copy or a share path is provided.
     The offline scan usually takes 5-40 minutes and cannot be interrupted (a WUA COM limitation).
@@ -56,7 +56,7 @@ param(
     [switch]$NoElevate,
     [switch]$AutoElevate
 )
-$Script:version = '0.8 (25 Nov 2026)'
+$Script:version = '0.8 (26 Nov 2026)'
 
 $ErrorActionPreference = 'Continue'
 
@@ -213,11 +213,14 @@ $script:HaveScanResults = $false
 $script:HaveInstalledList = $false
 $script:ItemMap = @{}
 $script:Worker = $null
+# one-click chain state: AutoChain is set while the [Scan + Install] sequence is running, so the completion handler starts the next step by itself; WorkerMode remembers which step just finished
+$script:AutoChain = $false
+$script:WorkerMode = ''
 
 # Enqueue a log line for the GUI thread to display and append to the log file
 function Add-GuiLog {
     param([string]$m)
-    $script:sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m))
+    $script:sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m))
 }
 
 # Drain queued log lines into the GUI textbox and the log file
@@ -349,7 +352,7 @@ $script:WorkerScript = {
     $script:wsusStyle = $WsusStyleNative    # remembered WSUS file-name layout that matched last, speeds up subsequent files
 
     # Queue a log line for the GUI thread
-    function Write-Log { param([string]$m) $sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'HH:mm:ss'), $m)) }
+    function Write-Log { param([string]$m) $sync.Log.Enqueue(('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)) }
     # Update the status-bar text shown in the GUI
     function Write-Status { param([string]$m) $sync.Status = $m }
     # Record the per-update status shown in the status column
@@ -1033,10 +1036,72 @@ $script:WorkerScript = {
         Write-Log ('Download queue: finished. {0} item(s) fully downloaded, {1} with problems. Copy the Updates folder to the target computer and run [Scan (offline)] there.' -f $doneOk, $doneFail)
     }
 
+    # True when a reboot from earlier installations is pending (CBS or Windows Update flagged it) - in this state new CBS packages (.msu/.cab) are only staged and processed at the next boot, so their quick "success, reboot required" does not mean they are installed
+    function Test-RebootPending {
+        try {
+            if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { return $true }
+            if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { return $true }
+        } catch { }
+        return $false
+    }
+
+    # Extended diagnostics after a failed DISM operation: the last lines DISM itself printed (when its output was captured) plus the error tail of the CBS servicing log - the real reason lands in the log file instead of only the exit code
+    function Write-DismFailureDetails {
+        param([string[]]$DismOutput)
+        if ($DismOutput -and @($DismOutput).Count -gt 0) {
+            # a redirected DISM progress bar is one long line cut by carriage returns: keep the last segment of each line, drop progress-only and empty lines
+            $tail = @($DismOutput | ForEach-Object { ([string]$_ -split "`r")[-1] } | Where-Object { $_.Trim() -ne '' -and $_ -notmatch '^\[+[=\.\s\d%]*\]+$' } | Select-Object -Last 12)
+            foreach ($l in $tail) {
+                if ($l.Length -gt 300) { $l = $l.Substring(0, 300) + '...' }
+                Write-Log ('DISM output: {0}' -f $l)
+            }
+        }
+        try {
+            $cbsLog = Join-Path $env:SystemRoot 'Logs\CBS\CBS.log'
+            if (Test-Path -LiteralPath $cbsLog) {
+                $errs = @(Get-Content -LiteralPath $cbsLog -Tail 300 -ErrorAction Stop | Where-Object { $_ -match '(?i)error|failed' } | Select-Object -Last 10)
+                Write-Log ('CBS log: {0} - last matching lines (the full log is there):' -f $cbsLog)
+                if ($errs.Count -eq 0) { Write-Log 'CBS log: no error lines in the tail.' }
+                foreach ($l in $errs) { Write-Log ('CBS: {0}' -f $l) }
+            } else { Write-Log ('CBS log not found: {0}' -f $cbsLog) }
+        } catch { Write-Log ('Could not read the CBS log: {0}' -f $_.Exception.Message) }
+        Write-Log ('DISM also writes its own log: {0}.' -f (Join-Path $env:SystemRoot 'Logs\DISM\dism.log'))
+    }
+
+    # Extended diagnostics for a failed installer run, written straight into the log file: every quiet line that was tried, file size, version and signature state, and for MSRT the state of its stub folder and mrt.log - enough to analyze the failure later without a live console
+    function Write-InstallerDiagnostics {
+        param($File, [int]$ExitCode, [string[]]$ArgLines)
+        Write-Log ('Diagnostics for {0} (exit code {1}):' -f $File.Name, $ExitCode)
+        foreach ($al in @($ArgLines)) { if ($al) { Write-Log ('Command line tried: {0}' -f $al) } }
+        try {
+            $fi = Get-Item -LiteralPath $File.FullName
+            $vi = $fi.VersionInfo
+            $sig = (Get-AuthenticodeSignature -LiteralPath $fi.FullName).Status
+            Write-Log ('File: {0:N1} MB, version "{1}", product "{2}", signature: {3}.' -f ($fi.Length / 1MB), $vi.FileVersion, $vi.ProductName, $sig)
+        } catch { Write-Log ('File metadata unavailable: {0}' -f $_.Exception.Message) }
+        if ($File.Name.ToLower().StartsWith('windows-kb890830')) {
+            # the package stub extracts its payload (mrt.exe) into %TEMP%\Microsoft\MRTStub and runs it from there - leftovers of a failed run show how far it got
+            $stubDir = Join-Path $env:TEMP 'Microsoft\MRTStub'
+            if (Test-Path -LiteralPath $stubDir) {
+                Write-Log ('MSRT stub folder: {0}, recent files:' -f $stubDir)
+                foreach ($f in @(Get-ChildItem -LiteralPath $stubDir -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 5)) { Write-Log ('MSRT stub: {0} ({1:N1} MB, {2})' -f $f.Name, ($f.Length / 1MB), $f.LastWriteTime) }
+            } else { Write-Log ('MSRT stub folder not found: {0} - the package was rejected before extraction.' -f $stubDir) }
+            $mrtLog = Join-Path $env:SystemRoot 'debug\mrt.log'
+            try {
+                if (Test-Path -LiteralPath $mrtLog) {
+                    Write-Log ('MSRT log: {0} (last written {1}), last lines:' -f $mrtLog, (Get-Item -LiteralPath $mrtLog).LastWriteTime)
+                    foreach ($l in @(Get-Content -LiteralPath $mrtLog -Tail 15 -ErrorAction Stop)) { Write-Log ('MSRT: {0}' -f $l) }
+                } else { Write-Log ('MSRT log not found ({0}) - the package did not get far enough to write it.' -f $mrtLog) }
+            } catch { Write-Log ('Could not read the MSRT log: {0}' -f $_.Exception.Message) }
+        }
+    }
+
     #  MODE: Install selected. Apply downloaded packages (msu/cab/exe/msi) to the local system
     function Invoke-Install {
         if (-not $IsAdmin) { throw 'Installation requires administrator rights. Restart the tool elevated.' }
         if (@($Selected).Count -eq 0) { Write-Log 'No updates selected.'; return }
+        # a reboot pending from earlier installations makes new CBS installs (.msu/.cab) unreliable: they are only staged and may reappear in the scan after the reboot - warn so the admin can reboot first
+        if (Test-RebootPending) { Write-Log 'WARNING: a reboot from earlier installations is already pending - new .msu/.cab packages will only be staged now. It is recommended to reboot first and run Install again afterwards.' }
         $totalItems = @($Selected).Count
         $idx = 0
         foreach ($uuid in $Selected) {
@@ -1062,6 +1127,7 @@ $script:WorkerScript = {
             $fi = 0
             $itemOk = 0
             $itemErr = 0
+            $itemStaged = $false
             foreach ($file in $files) {
                 if ($sync.Cancel) { throw $CancelMsg }
                 $fi++
@@ -1081,7 +1147,12 @@ $script:WorkerScript = {
                 $exitCode = -1
                 $pkgIdentity = ''
                 $exitTool = $ext
-                $argLine2 = $null
+                $argCandidates = @()    # quiet lines tried in order for exe installers (a wrapper that does not recognize a switch answers Win32 1639)
+                # whether a reboot was already pending when this package started: CBS packages (.msu/.cab) are then only staged, the real installation happens after the reboot
+                $rebootWasPending = Test-RebootPending
+                if ($rebootWasPending -and ($ext -eq '.msu' -or $ext -eq '.cab')) {
+                    Write-Log ('{0}: WARNING: a reboot from a previous update is already pending - {1} will only be staged now, its quick completion does not mean it is installed.' -f $it.KB, $file.Name)
+                }
                 if ($ext -eq '.msu') {
                     Write-Log ('{0}: wusa.exe (silent install): {1}' -f $it.KB, $file.Name)
                     $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wusa.exe') -ArgumentList ('"{0}" /quiet /norestart' -f $file.FullName) -Wait -PassThru -WindowStyle Hidden
@@ -1130,22 +1201,25 @@ $script:WorkerScript = {
                 } elseif ($ext -eq '.exe') {
                     $n = $file.Name.ToLower()
                     if ($n.StartsWith('ndp') -or $n.StartsWith('ofv') -or $n.Contains('2553065')) {
-                        $argLine = '"{0}" /q /norestart' -f $file.FullName
+                        $argCandidates += [pscustomobject]@{ Line = ('"{0}" /q /norestart' -f $file.FullName); Label = '/q /norestart' }
                     } elseif ($n.StartsWith('windows-kb890830')) {
-                        # MSRT: the documented quiet switch is /q, but the package wraps an MSI whose msiexec rejects a bare /q with 1639 (0x80070667) - retry once with the MSI-style quiet line
-                        $argLine = '"{0}" /q' -f $file.FullName
-                        $argLine2 = '"{0}" /qn /norestart' -f $file.FullName
+                        # MSRT: the accepted quiet syntax depends on the wrapper generation - the documented /Q, the Windows Update context markers (/W, /WindowsUpdate) of the 2026 msi-free stub, or the MSI-style line of the older builds - so the candidates are probed in turn until one is accepted
+                        $argCandidates += [pscustomobject]@{ Line = ('"{0}" /Q' -f $file.FullName); Label = '/Q' }
+                        $argCandidates += [pscustomobject]@{ Line = ('"{0}" /W' -f $file.FullName); Label = '/W' }
+                        $argCandidates += [pscustomobject]@{ Line = ('"{0}" /WindowsUpdate' -f $file.FullName); Label = '/WindowsUpdate' }
+                        $argCandidates += [pscustomobject]@{ Line = ('"{0}" /qn /norestart' -f $file.FullName); Label = '/qn /norestart' }
                         $exitTool = 'msrt'
                     } else {
-                        $argLine = '"{0}" /q /z' -f $file.FullName
+                        $argCandidates += [pscustomobject]@{ Line = ('"{0}" /q /z' -f $file.FullName); Label = '/q /z' }
                     }
                     Write-Log ('{0}: running installer: {1}' -f $it.KB, $file.Name)
-                    $p = Start-Process -FilePath $file.FullName -ArgumentList $argLine -Wait -PassThru
-                    $exitCode = $p.ExitCode
-                    if ($argLine2 -and $exitCode -eq $ExitBadCommandLine) {
-                        Write-Log ('{0}: {1} rejected the quiet switch (Win32 1639 ERROR_BAD_COMMAND_LINE) - retrying with the MSI-style quiet line.' -f $it.KB, $file.Name)
-                        $p = Start-Process -FilePath $file.FullName -ArgumentList $argLine2 -Wait -PassThru
+                    $tryIdx = 0
+                    while ($true) {
+                        $p = Start-Process -FilePath $file.FullName -ArgumentList $argCandidates[$tryIdx].Line -Wait -PassThru
                         $exitCode = $p.ExitCode
+                        $tryIdx++
+                        if ($exitCode -ne $ExitBadCommandLine -or $tryIdx -ge $argCandidates.Count) { break }
+                        Write-Log ('{0}: {1} rejected the quiet line {2} (Win32 1639 ERROR_BAD_COMMAND_LINE) - trying the next candidate.' -f $it.KB, $file.Name, $argCandidates[$tryIdx - 1].Label)
                     }
                 } else {
                     Write-Log ('{0}: format {1} is not supported for manual installation - skipped.' -f $it.KB, $ext)
@@ -1154,17 +1228,28 @@ $script:WorkerScript = {
                 $info = Get-ExitCodeInfo -Code $exitCode -Tool $exitTool
                 if ($info.Reboot) { $sync.RebootNeeded = $true }
                 if ($info.Ok) { $itemOk++ } else { $itemErr++ }
+                # a CBS package that returned "reboot required" while a reboot was ALREADY pending was only staged, not installed - report that honestly instead of "installed successfully"
+                if ($info.Reboot -and $rebootWasPending -and ($exitTool -eq '.msu' -or $exitTool -eq '.cab')) {
+                    $itemStaged = $true
+                    Write-Log ('{0}: {1} was only STAGED: a reboot was already pending from a previous update. Reboot, then re-scan and install it again if it still shows as missing.' -f $it.KB, $file.Name)
+                }
+                # extended diagnostics for failed installers land in the log file: command line, file metadata, signature and, where applicable, DISM/CBS or MSRT log tails
+                if (-not $info.Ok) {
+                    Write-InstallerDiagnostics -File $file -ExitCode $exitCode -ArgLines @($argCandidates | ForEach-Object { $_.Line })
+                    if ($ext -eq '.cab') { Write-DismFailureDetails -DismOutput $null }
+                }
                 Write-Log ('{0}: {1} → exit code {2}: {3}' -f $it.KB, $file.Name, $exitCode, $info.Text)
                 Set-ItemStatus $uuid ('Result: {0}' -f $info.Text)
                 Add-StateRecord -KB $it.KB -FilePath $file.FullName -Method $ext -Identity $pkgIdentity -ExitCode $exitCode
             }
             $statTxt = 'Done'
             if ($itemErr -gt 0) { $statTxt = ('Completed with errors ({0})' -f $itemErr) }
+            elseif ($itemStaged) { $statTxt = 'Staged, not installed - reboot first, then re-scan and install again if it reappears' }
             elseif ($itemOk -gt 0 -and $sync.RebootNeeded) { $statTxt = 'Installed, reboot required' }
             elseif ($itemOk -gt 0) { $statTxt = 'Installed' }
             Set-ItemStatus $uuid $statTxt
-            # Remember items installed without errors to uncheck them in the GUI afterwards
-            if ($itemOk -gt 0 -and $itemErr -eq 0) { $sync.InstalledOk.Enqueue([string]$uuid) }
+            # Remember items installed without errors to uncheck them in the GUI afterwards; staged-only items stay checked - after the reboot they may need another Install run
+            if ($itemOk -gt 0 -and $itemErr -eq 0 -and -not $itemStaged) { $sync.InstalledOk.Enqueue([string]$uuid) }
         }
         Write-Log 'Install: all selected updates processed.'
     }
@@ -1292,20 +1377,33 @@ $script:WorkerScript = {
         if (-not $IsAdmin) { throw 'Cleanup requires administrator rights. Restart the tool elevated.' }
         $freeBefore = [double](Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace
         Write-Log ('Cleanup: started. Free space on {0}: {1:N1} GB.' -f $env:SystemDrive, ($freeBefore / 1GB))
-        # 1) WinSxS superseded components (DISM runs in its own console window and shows its own progress)
+        # 1) WinSxS superseded components (DISM output is captured; on failure its tail and the CBS log tail land in the log file)
         Write-Status 'Removing superseded components (WinSxS)...'
         Set-Progress 0 'DISM /StartComponentCleanup (WinSxS)'
         Write-Log 'Cleanup: removing superseded components from the WinSxS store (the Disk Cleanup "Windows Update Cleanup" engine); this may take 10-30 minutes.'
         if ($ResetBase) { Write-Log 'Cleanup: /ResetBase mode - after this run NO installed update can be uninstalled anymore.' }
+        # a pending reboot from a recent install leaves uncommitted components in the store - StartComponentCleanup (especially with /ResetBase) often fails on them with access denied; surface the state before the long run
+        if (Test-RebootPending) { Write-Log 'Cleanup: WARNING: a reboot is still pending from recent installations - StartComponentCleanup may fail on the not yet committed components (access denied). Reboot first when possible.' }
         $dismArgs = '/Online /NoRestart /Cleanup-Image /StartComponentCleanup'
         if ($ResetBase) { $dismArgs += ' /ResetBase' }
+        # run DISM with its output captured to temp files: the old console window showed the text but closed and lost it, now the output tail lands in the log on failure
+        $dismOut = Join-Path $env:TEMP ('wmuo-dism-out-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        $dismErr = Join-Path $env:TEMP ('wmuo-dism-err-' + [Guid]::NewGuid().ToString('N') + '.tmp')
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\Dism.exe') -ArgumentList $dismArgs -Wait -PassThru
+        $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\Dism.exe') -ArgumentList $dismArgs -WindowStyle Hidden -RedirectStandardOutput $dismOut -RedirectStandardError $dismErr -Wait -PassThru
         $sw.Stop()
+        $dismText = @()
+        try { $dismText = @(Get-Content -LiteralPath $dismOut -ErrorAction SilentlyContinue) + @(Get-Content -LiteralPath $dismErr -ErrorAction SilentlyContinue) } catch { }
+        Remove-Item -LiteralPath $dismOut, $dismErr -Force -ErrorAction SilentlyContinue
         $info = Get-ExitCodeInfo -Code $p.ExitCode -Tool 'dism-cleanup'
         if ($info.Reboot) { $sync.RebootNeeded = $true }
         if ($info.Ok) { Write-Log ('Cleanup: component store cleaned in {0:00} min {1:00} sec (DISM exit code {2}: {3}).' -f [int]$sw.Elapsed.TotalMinutes, $sw.Elapsed.Seconds, $p.ExitCode, $info.Text) }
-        else { Write-Log ('Cleanup: DISM StartComponentCleanup failed - exit code {0}: {1}.' -f $p.ExitCode, $info.Text) }
+        else {
+            Write-Log ('Cleanup: DISM StartComponentCleanup failed - exit code {0}: {1}.' -f $p.ExitCode, $info.Text)
+            Write-DismFailureDetails -DismOutput $dismText
+            # access denied right after a big update usually means the servicing stack still has pending work - a retry after a reboot is the first thing to try
+            if (Test-RebootPending) { Write-Log 'Cleanup: a reboot is currently pending - reboot and run the cleanup again.' }
+        }
         if ($sync.Cancel) { throw $CancelMsg }
         # 2) Windows Update caches
         Write-Status 'Clearing the Windows Update cache...'
@@ -1381,6 +1479,7 @@ function Start-Worker {
     }
     $sync.Cancel = $false
     $sync.Busy = $true
+    $script:WorkerMode = $Mode
     $sync.ScanDone = $false
     $sync.InstalledDone = $false
     $sync.UninstallDone = $false
@@ -1529,9 +1628,11 @@ function Update-QueueMarkers {
 
 # Handle completion of the background runspace (populate lists, prompt for reboot)
 function Receive-WorkerFinished {
+    $scanJustDone = $false
     if ($sync.ScanDone) {
         $sync.ScanDone = $false
         $script:HaveScanResults = $true
+        $scanJustDone = $true
         Update-UpdatesList
     }
     if ($sync.InstalledDone) {
@@ -1547,6 +1648,53 @@ function Receive-WorkerFinished {
         $sync.QueueDlDone = $false
         Update-QueueList
         $tabs.SelectedTab = $tabQueue
+    }
+
+    # One-click chain (the [Scan + Install] button): start the next step automatically once the current worker has finished; the chain is armed only by that button and disarms itself before the install step is launched
+    if ($script:AutoChain) {
+        if ($sync.Cancel) {
+            $script:AutoChain = $false
+            Add-GuiLog 'One-click run: cancellation was requested - the remaining steps are not started.'
+        } elseif ($scanJustDone) {
+            # the scan rebuilt the list and re-checked the updates with direct file URLs: download the checked ones whose files are not on disk yet, or go straight to the install
+            $sel = Get-CheckedUpdates
+            $missing = @()
+            foreach ($uuid in $sel) {
+                foreach ($it in $sync.Result) {
+                    if ($it.UUID -eq $uuid) {
+                        if (-not $it.DownloadedAll) { $missing += $uuid }
+                        break
+                    }
+                }
+            }
+            if ($sel.Count -eq 0) {
+                $script:AutoChain = $false
+                Add-GuiLog 'One-click run: nothing is checked after the scan - the installation is not started.'
+            } elseif ($missing.Count -gt 0) {
+                Add-GuiLog ('One-click run: {0} of {1} checked update(s) still miss their files - downloading them first.' -f $missing.Count, $sel.Count)
+                # disarm first and re-arm after a successful launch: a refused launch must never leave the chain armed
+                $script:AutoChain = $false
+                if (Start-Worker -Mode $script:ModeDownload -Selected $sel) { $script:AutoChain = $true }
+            } else {
+                $script:AutoChain = $false
+                Add-GuiLog ('One-click run: all files are already on disk - installing {0} update(s). Do not close the window until it finishes.' -f $sel.Count)
+                [void](Start-Worker -Mode $script:ModeInstall -Selected $sel)
+            }
+        } elseif ($script:WorkerMode -eq $script:ModeDownload) {
+            # the download step of the one-click run has finished - install whatever is still checked (items whose files failed to download are skipped by the install itself)
+            $script:AutoChain = $false
+            $sel = Get-CheckedUpdates
+            if ($sel.Count -eq 0) {
+                Add-GuiLog 'One-click run: nothing is checked - the installation is not started.'
+            } else {
+                Add-GuiLog ('One-click run: download step finished - installing {0} update(s). Do not close the window until it finishes.' -f $sel.Count)
+                [void](Start-Worker -Mode $script:ModeInstall -Selected $sel)
+            }
+        } else {
+            # the scan step did not complete (its error is already in the log) - stop the chain
+            $script:AutoChain = $false
+            Add-GuiLog 'One-click run: the scan step did not complete - the following steps are skipped.'
+        }
     }
     # Uncheck updates that were installed without errors
     $okIds = @()
@@ -1663,9 +1811,10 @@ $form.Add_Shown({
 $panelButtons = New-Object System.Windows.Forms.TableLayoutPanel
 $panelButtons.Dock = 'Top'
 $panelButtons.Height = 36
-$panelButtons.ColumnCount = 9
+$panelButtons.ColumnCount = 10
 $panelButtons.RowCount = 1
 $panelButtons.Padding = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
+[void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
 [void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
 [void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
 [void]$panelButtons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle -ArgumentList ([System.Windows.Forms.SizeType]::AutoSize)))
@@ -1687,6 +1836,10 @@ $btnDownload.AutoSize = $true
 $btnInstall = New-Object System.Windows.Forms.Button
 $btnInstall.Text = 'Install selected'
 $btnInstall.AutoSize = $true
+$btnScanInstall = New-Object System.Windows.Forms.Button
+$btnScanInstall.Text = 'Scan + Install'
+$btnScanInstall.AutoSize = $true
+$toolTip.SetToolTip($btnScanInstall, "One-click run: offline scan, then download of the still-missing files, then install of everything that stays checked.`nPress it once and come back when the log stops - no extra confirmations in between.")
 $btnMarkAll = New-Object System.Windows.Forms.Button
 $btnMarkAll.Text = 'Mark all'
 $btnMarkAll.AutoSize = $true
@@ -1708,12 +1861,13 @@ $btnAbout.AutoSize = $true
 $panelButtons.Controls.Add($btnScan, 0, 0)
 $panelButtons.Controls.Add($btnDownload, 1, 0)
 $panelButtons.Controls.Add($btnInstall, 2, 0)
-$panelButtons.Controls.Add($btnMarkAll, 3, 0)
-$panelButtons.Controls.Add($btnClearAll, 4, 0)
-$panelButtons.Controls.Add($btnCleanup, 5, 0)
-$panelButtons.Controls.Add($btnOpenDir, 6, 0)
-$panelButtons.Controls.Add($btnCancelOp, 7, 0)
-$panelButtons.Controls.Add($btnAbout, 8, 0)
+$panelButtons.Controls.Add($btnScanInstall, 3, 0)
+$panelButtons.Controls.Add($btnMarkAll, 4, 0)
+$panelButtons.Controls.Add($btnClearAll, 5, 0)
+$panelButtons.Controls.Add($btnCleanup, 6, 0)
+$panelButtons.Controls.Add($btnOpenDir, 7, 0)
+$panelButtons.Controls.Add($btnCancelOp, 8, 0)
+$panelButtons.Controls.Add($btnAbout, 9, 0)
 
 # --- Tabs ---
 $tabs = New-Object System.Windows.Forms.TabControl
@@ -1919,6 +2073,7 @@ $btnBrowse.Add_Click({
 $btnCatalogDl.Add_Click({ [void](Start-Worker -Mode $script:ModeGetCatalog) })
 
 $btnScan.Add_Click({
+        $script:AutoChain = $false    # a plain scan must never chain into the download/install steps
         Add-GuiLog ('Starting the offline scan. Catalog: "{0}" (empty = the local copy in the working folder, or a download).' -f $txtCatalog.Text)
         [void](Start-Worker -Mode $script:ModeScan)
     })
@@ -1936,6 +2091,12 @@ $btnInstall.Add_Click({
         if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
             [void](Start-Worker -Mode $script:ModeInstall -Selected $sel)
         }
+    })
+
+$btnScanInstall.Add_Click({
+        Add-GuiLog ('Starting the one-click run: offline scan, then download of the still-missing files, then install of everything still checked. Catalog: "{0}" (empty = the local copy in the working folder, or a download).' -f $txtCatalog.Text)
+        # the chain flag makes the completion handler run the download/install steps by itself - no confirmation dialogs, so the run can be left unattended
+        if (Start-Worker -Mode $script:ModeScan) { $script:AutoChain = $true }
     })
 
 $btnMarkAll.Add_Click({ foreach ($item in $lvUpdates.Items) { $item.Checked = $true } })
@@ -1956,7 +2117,7 @@ $btnAbout.Add_Click({
         $about.Text = 'About'
         $about.FormBorderStyle = 'FixedDialog'
         $about.StartPosition = 'CenterParent'
-        $about.Size = New-Object System.Drawing.Size(520, 300)
+        $about.ClientSize = New-Object System.Drawing.Size(504, 302)
         $about.MaximizeBox = $false
         $about.MinimizeBox = $false
         $about.ShowInTaskbar = $false
@@ -1975,7 +2136,9 @@ $btnAbout.Add_Click({
         $btnOk = New-Object System.Windows.Forms.Button
         $btnOk.Text = 'OK'
         $btnOk.DialogResult = 'OK'
-        $btnOk.Location = New-Object System.Drawing.Point(415, 245)
+        # anchored to the bottom-right corner and placed with a margin, so DPI/font scaling can no longer push the button half out of the dialog
+        $btnOk.Location = New-Object System.Drawing.Point(415, 263)
+        $btnOk.Anchor = 'Bottom, Right'
         [void]$about.Controls.Add($btnOk)
         $about.AcceptButton = $btnOk
         [void]$about.ShowDialog($form)
@@ -2117,6 +2280,7 @@ $timer.Add_Tick({
         $btnScan.Enabled = (-not $busy) -and $script:IsAdmin
         $btnDownload.Enabled = (-not $busy) -and $script:HaveScanResults
         $btnInstall.Enabled = (-not $busy) -and $script:HaveScanResults -and $script:IsAdmin
+        $btnScanInstall.Enabled = (-not $busy) -and $script:IsAdmin
         $btnCatalogDl.Enabled = (-not $busy)
         $btnMarkAll.Enabled = (-not $busy) -and $script:HaveScanResults
         $btnClearAll.Enabled = (-not $busy) -and $script:HaveScanResults
@@ -2168,11 +2332,21 @@ try {
 $adminTxt = 'no'
 if ($script:IsAdmin) { $adminTxt = 'yes' }
 Add-GuiLog ('OS: {0}; build: {1}; elevated rights: {2}.' -f $osName, $osBuild, $adminTxt)
+# machine identity for the admin reading another computer's log: computer name plus its domain or workgroup
+$machineTxt = $env:COMPUTERNAME
+try {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    $domKind = 'workgroup'
+    if ($cs.PartOfDomain) { $domKind = 'domain' }
+    $machineTxt = ('{0}; {1}: {2}' -f $cs.Name, $domKind, $cs.Domain)
+} catch { }
+Add-GuiLog ('Computer: {0}.' -f $machineTxt)
 $modeTxt = 'fallback folder (the script folder is not writable)'
 if ($script:PortableMode) { $modeTxt = 'portable mode (next to the script)' }
 Add-GuiLog ('Working folder: {0} - {1}. Update files go to {0}\Updates.' -f $script:WorkDir, $modeTxt)
 Add-GuiLog ('Log file: {0}.' -f $script:LogFile)
 Add-GuiLog 'Workflow: [Scan] -> mark the needed updates -> [Download selected] -> [Install selected] -> after testing [Cleanup leftovers].'
+Add-GuiLog 'One-click: [Scan + Install] runs the whole sequence unattended - scan, download the missing files, install everything checked.'
 Add-GuiLog 'Offline -> online workflow: [Scan] on the offline PC -> [Add checked to queue] -> move the project folder to an online PC -> [Download queue] -> move the Updates folder back -> [Scan (offline)] -> [Install selected].'
 if (-not $script:IsAdmin) { Add-GuiLog 'Running WITHOUT administrator rights: the offline scan needs elevation too (it registers a scan package in the Windows Update service store), so scan/install/uninstall/cleanup are disabled; the download queue and file downloads work.' }
 if ($script:DownloadQueue.Count -gt 0) { Add-GuiLog ('Download queue: {0} item(s) restored from download-queue.json.' -f $script:DownloadQueue.Count) }
